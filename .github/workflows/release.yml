@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  release:
+    name: Build, attest and publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check that the tag matches the script version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(./ctxup -V | cut -d' ' -f2)
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "Tag ${TAG} does not match ctxup ${version}" >&2
+            exit 1
+          fi
+      - uses: bats-core/bats-action@3566550e0f594451ac0f58fcbfdeca93aa29a45e # 4.1.0
+        with:
+          bats-version: 1.14.0
+          support-install: false
+          assert-install: false
+          detik-install: false
+          file-install: false
+      - name: Unit tests
+        run: bats tests/unit
+      - name: Checksums
+        run: sha256sum ctxup > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ctxup
+            SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "${TAG}" --draft --verify-tag --generate-notes --title "ctxup ${TAG}" ctxup SHA256SUMS
+          gh release edit "${TAG}" --draft=false

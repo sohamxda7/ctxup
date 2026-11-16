@@ -1,0 +1,62 @@
+name: Distribution matrix
+
+# Installs, upgrades and removes the real Citrix packages on every supported
+# release. It downloads about 2 GB from citrix.com, so it only runs weekly,
+# on demand, and for pull requests that touch the installer.
+
+on:
+  schedule:
+    - cron: "17 3 * * 6"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ctxup
+      - tests/**
+      - .github/workflows/matrix.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream:
+    name: Citrix download pages still parse
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List versions
+        run: ./ctxup list
+      - name: Resolve the latest package for each package type
+        run: |
+          for os in ubuntu-24.04 rockylinux-9 rockylinux-10; do
+            CTXUP_OS_RELEASE="tests/fixtures/os-release/${os}" ./ctxup install --dry-run
+          done
+
+  matrix:
+    name: Install, upgrade, remove
+    needs: upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PODMAN: sudo podman
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the Citrix packages
+        run: tests/fetch-packages.sh
+      - name: Run the matrix
+        run: tests/matrix.sh -j 2
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: matrix-results
+          path: tests/.results
+          include-hidden-files: true
+          retention-days: 14

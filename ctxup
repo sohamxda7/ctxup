@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+#
+# ctxup - install, update and remove Citrix Workspace app on Linux.
+#
+# The Citrix packages are downloaded from citrix.com on the machine that runs
+# this script. Nothing owned by Citrix is shipped with it.
+#
+# https://github.com/sohamxda7/ctxup
+# SPDX-License-Identifier: MIT
+
+set -Eeuo pipefail
+
+CTXUP_VERSION="0.1.0"
+
+CITRIX_SITE="https://www.citrix.com"
+INDEX_URL="${CTXUP_INDEX_URL:-$CITRIX_SITE/downloads/workspace-app/}"
+EULA_URL="https://www.cloud.com/content/dam/cloud/documents/legal/end-user-agreement.pdf"
+ICAROOT="/opt/Citrix/ICAClient"
+
+# Releases this script is tested on. Anything else needs --force.
+SUPPORTED_UBUNTU="22.04 24.04 26.04 26.10"
+SUPPORTED_DEBIAN="12 13"
+SUPPORTED_EL="8 9 10"
+
+# Options (set by parse_args).
+OPT_VERSION=""
+OPT_YES=0
+OPT_ACCEPT_EULA=0
+OPT_FORCE=0
+OPT_NO_VERIFY=0
+OPT_COLOR=1
+OPT_DIR=""
+
+# Filled in by detect_os.
+OS_FAMILY="" # deb | rpm
+OS_BASE=""   # ubuntu | debian | el
+OS_BASE_VER=""
+OS_NAME=""
+OS_ARCH="" # amd64 | arm64
+OS_PROBLEM=""
+
+WORKDIR=""
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+C_RESET="" C_BOLD="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE=""
+
+setup_colors() {
+  if [[ $OPT_COLOR -eq 1 && -t 2 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+    C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_BLUE=$'\033[34m'
+  else
+    C_RESET="" C_BOLD="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE=""
+  fi
+}
+
+info() { printf '%s==>%s %s\n' "$C_BLUE$C_BOLD" "$C_RESET" "$*" >&2; }
+ok() { printf '%s ok %s %s\n' "$C_GREEN$C_BOLD" "$C_RESET" "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2; }
+err() { printf '%serror:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; }
+die() {
+  err "$*"
+  exit 1
+}
+
+cleanup() {
+  if [[ -n $WORKDIR && -d $WORKDIR ]]; then
+    rm -rf -- "$WORKDIR"
+  fi
+}
+trap cleanup EXIT
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ask "question" default(y|n) -> returns 0 for yes
+ask() {
+  local question=$1 default=${2:-n} reply hint="[y/N]"
+  [[ $default == y ]] && hint="[Y/n]"
+  if [[ $OPT_YES -eq 1 ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    die "'$question' needs an answer but there is no terminal. Re-run with --yes."
+  fi
+  while true; do
+    read -r -p "$question $hint " reply || die "No answer given."
+    reply=${reply:-$default}
+    case ${reply,,} in
+      y | yes) return 0 ;;
+      n | no) return 1 ;;
+      *) echo "Please answer y or n." >&2 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Operating system detection
+# ---------------------------------------------------------------------------
+
+# os_field KEY FILE -> value of KEY in an os-release file, unquoted.
+os_field() {
+  local key=$1 file=$2 line value
+  line=$(grep -m1 -E "^${key}=" "$file" 2>/dev/null) || return 0
+  value=${line#*=}
+  value=${value%\"}
+  value=${value#\"}
+  value=${value%\'}
+  value=${value#\'}
+  printf '%s' "$value"
+}
+
+ubuntu_version_for() {
+  case $1 in
+    focal) echo 20.04 ;;
+    jammy) echo 22.04 ;;
+    noble) echo 24.04 ;;
+    resolute) echo 26.04 ;;
+    stonking) echo 26.10 ;;
+    *) return 1 ;;
+  esac
+}
+
+debian_version_for() {
+  case $1 in
+    bullseye) echo 11 ;;
+    bookworm) echo 12 ;;
+    trixie) echo 13 ;;
+    forky | testing | sid | kali-rolling) echo 14 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_os() {
+  local file=${CTXUP_OS_RELEASE:-/etc/os-release}
+  local machine=${CTXUP_MACHINE:-$(uname -m)}
+  local id id_like version_id ubuntu_codename debian_codename codename
+
+  OS_FAMILY="" OS_BASE="" OS_BASE_VER="" OS_NAME="" OS_ARCH="" OS_PROBLEM=""
+
+  [[ -r $file ]] || die "Cannot read $file, so the distribution is unknown."
+
+  id=$(os_field ID "$file")
+  id_like=$(os_field ID_LIKE "$file")
+  version_id=$(os_field VERSION_ID "$file")
+  ubuntu_codename=$(os_field UBUNTU_CODENAME "$file")
+  debian_codename=$(os_field DEBIAN_CODENAME "$file")
+  codename=$(os_field VERSION_CODENAME "$file")
+  OS_NAME=$(os_field PRETTY_NAME "$file")
+  OS_NAME=${OS_NAME:-$id $version_id}
+
+  case $machine in
+    x86_64 | amd64) OS_ARCH=amd64 ;;
+    aarch64 | arm64) OS_ARCH=arm64 ;;
+    *) OS_PROBLEM="Citrix does not publish packages for $machine." ;;
+  esac
+
+  case " $id $id_like " in
+    *" ubuntu "*)
+      OS_FAMILY=deb OS_BASE=ubuntu
+      if [[ $id == ubuntu ]]; then
+        OS_BASE_VER=$version_id
+      else
+        # Mint, Pop!_OS, Zorin, elementary: the base release is in the codename.
+        OS_BASE_VER=$(ubuntu_version_for "${ubuntu_codename:-$codename}") || OS_BASE_VER=""
+      fi
+      ;;
+    *" debian "* | *" raspbian "* | *" kali "*)
+      OS_FAMILY=deb OS_BASE=debian
+      if [[ $id == debian || $id == raspbian ]] && [[ -n $version_id ]]; then
+        OS_BASE_VER=${version_id%%.*}
+      else
+        # LMDE, MX, Kali, Debian testing: map the codename to a release.
+        OS_BASE_VER=$(debian_version_for "${debian_codename:-$codename}") || OS_BASE_VER=""
+      fi
+      ;;
+    *" fedora "*)
+      if [[ $id == fedora ]]; then
+        OS_PROBLEM="Fedora is not supported: Citrix's RPM needs a WebKitGTK version Fedora no longer ships."
+      else
+        OS_FAMILY=rpm OS_BASE=el OS_BASE_VER=${version_id%%.*}
+      fi
+      ;;
+    *" rhel "* | *" centos "*)
+      OS_FAMILY=rpm OS_BASE=el OS_BASE_VER=${version_id%%.*}
+      ;;
+    *)
+      OS_PROBLEM="${OS_NAME:-This distribution} is not supported."
+      ;;
+  esac
+
+  [[ -n $OS_PROBLEM ]] && return 0
+
+  if [[ -z $OS_BASE_VER ]]; then
+    OS_PROBLEM="Could not work out which $OS_BASE release $OS_NAME is based on."
+    return 0
+  fi
+
+  local supported
+  case $OS_BASE in
+    ubuntu) supported=$SUPPORTED_UBUNTU ;;
+    debian) supported=$SUPPORTED_DEBIAN ;;
+    *) supported=$SUPPORTED_EL ;;
+  esac
+  if [[ " $supported " != *" $OS_BASE_VER "* ]]; then
+    OS_PROBLEM="$OS_NAME ($OS_BASE $OS_BASE_VER) is outside the tested range: $supported."
+  elif [[ $OS_FAMILY == rpm && $OS_ARCH == arm64 ]]; then
+    OS_PROBLEM="Citrix publishes ARM64 packages only as .deb, not .rpm."
+  fi
+  return 0
+}
+
+describe_os() {
+  local base=$OS_BASE
+  [[ $base == el ]] && base="RHEL"
+  if [[ -n $OS_BASE ]]; then
+    printf '%s (%s %s, %s)' "$OS_NAME" "$base" "$OS_BASE_VER" "$OS_ARCH"
+  else
+    printf '%s' "$OS_NAME"
+  fi
+}
+
+require_supported_os() {
+  detect_os
+  [[ -z $OS_PROBLEM ]] && return 0
+  if [[ $OPT_FORCE -eq 1 && -n $OS_FAMILY && -n $OS_ARCH ]]; then
+    warn "$OS_PROBLEM Continuing because of --force."
+    return 0
+  fi
+  err "$OS_PROBLEM"
+  [[ -n $OS_FAMILY && -n $OS_ARCH ]] && err "Use --force to try anyway."
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Talking to citrix.com
+# ---------------------------------------------------------------------------
+
+# fetch URL -> page body on stdout. The download pages are slow and now and
+# then answer 504, so retry a few times before giving up.
+fetch() {
+  local url=$1 attempt delay=3 max=${CTXUP_FETCH_TRIES:-4}
+  have curl || die "curl is required. Install it and run ctxup again."
+  for ((attempt = 1; attempt <= max; attempt++)); do
+    if curl --fail --silent --show-error --location --compressed \
+      --connect-timeout 20 --max-time 180 \
+      --user-agent "ctxup/$CTXUP_VERSION" "$url"; then
+      return 0
+    fi
+    if ((attempt < max)); then
+      warn "Could not fetch $url (attempt $attempt of $max), retrying in ${delay}s."
+      sleep "$delay"
+      delay=$((delay * 2))
+    fi
+  done
+  return 1
+}
+
+# parse_index < index.html -> "version|path" lines, newest first.
+parse_index() {
+  tr '\r\n' '  ' |
+    grep -oE '<a [^>]*href="/downloads/workspace-app/(linux|legacy-workspace-app-for-linux)/[^"]+"[^>]*>[[:space:]]*Citrix Workspace app [0-9]+(\.[0-9]+)* for Linux[[:space:]]*</a>' |
+    sed -E 's|.*href="([^"]+)".*Citrix Workspace app ([0-9.]+) for Linux.*|\2\|\1|' |
+    sort -t'|' -k1,1 -V -r |
+    awk -F'|' '!seen[$1]++'
+}
+
+# parse_packages < version-page.html -> "filename|url|sha256" lines.
+# The link sits in a rel="//downloads.citrix.com/..." attribute and its
+# checksum follows a few lines later as "SHA-256 - <hex>".
+parse_packages() {
+  awk '
+    function flush() {
+      if (url != "") {
+        file = url
+        sub(/\?.*$/, "", file)
+        sub(/^.*\//, "", file)
+        printf "%s|https:%s|%s\n", file, url, sum
+      }
+      url = ""; sum = ""
+    }
+    {
+      line = $0
+      if (match(line, /rel="\/\/downloads\.citrix\.com\/[^"]+"/)) {
+        flush()
+        url = substr(line, RSTART + 5, RLENGTH - 6)
+        gsub(/&amp;/, "\\&", url)
+        gsub(/[[:space:]]/, "", url)
+      }
+      if (url != "" && sum == "" && match(line, /SHA-256[[:space:]]*[-:][[:space:]]*[0-9a-fA-F]+/)) {
+        candidate = substr(line, RSTART, RLENGTH)
+        sub(/^.*[-:][[:space:]]*/, "", candidate)
+        if (length(candidate) == 64) sum = tolower(candidate)
+      }
+    }
+    END { flush() }
+  '
+}
+
+# package_pattern KIND -> extended regex matching the file name of that
+# package for the detected OS. File names differ from release to release
+# (with and without a "gcc-N" tag), so the patterns are deliberately loose.
+package_pattern() {
+  local kind=$1 tar_arch=x64
+  [[ $OS_ARCH == arm64 ]] && tar_arch=arm64
+  case $OS_FAMILY:$kind in
+    deb:main) echo "^icaclient(-gcc-[0-9]+)?_[0-9.]+_${OS_ARCH}\\.deb\$" ;;
+    deb:usb) echo "^ctxusb(-gcc-[0-9]+)?_[0-9.]+_${OS_ARCH}\\.deb\$" ;;
+    rpm:main) echo '^ICAClient-rhel-(gcc-[0-9]+-)?[0-9.]+-[0-9]+\.x86_64\.rpm$' ;;
+    rpm:usb) echo '^ctxusb-(gcc-[0-9]+-)?[0-9.]+-[0-9]+\.x86_64\.rpm$' ;;
+    rpm:appprotection) echo '^ctxappprotection-(gcc-[0-9]+-)?[0-9.]+-[0-9]+\.x86_64\.rpm$' ;;
+    *:tarball) echo "^linux${tar_arch}-(gcc-[0-9]+-)?[0-9.]+\\.tar\\.gz\$" ;;
+    *) return 1 ;;
+  esac
+}
+
+# pick_package KIND < package-list -> the first matching "file|url|sha" line.
+pick_package() {
+  local pattern
+  pattern=$(package_pattern "$1") || return 1
+  PATTERN=$pattern awk -F'|' '$1 ~ ENVIRON["PATTERN"] { print; found = 1; exit } END { exit !found }'
+}
+
+# full_version FILENAME -> 26.08.0.225
+full_version() {
+  grep -oE '[0-9]+(\.[0-9]+){2,}' <<<"$1" | head -n1
+}
+
+VERSION_LIST=""
+
+load_versions() {
+  [[ -n $VERSION_LIST ]] && return 0
+  info "Reading the version list from citrix.com"
+  local page
+  page=$(fetch "$INDEX_URL") || die "Could not reach $INDEX_URL. Check the network connection and try again."
+  VERSION_LIST=$(parse_index <<<"$page")
+  [[ -n $VERSION_LIST ]] || die "No Linux releases found on $INDEX_URL. The page layout may have changed; please report it."
+}
+
+latest_version() { head -n1 <<<"$VERSION_LIST" | cut -d'|' -f1; }
+
+# version_page VERSION -> absolute URL of that release's download page.
+version_page() {
+  local want=$1 path
+  path=$(awk -F'|' -v v="$want" '$1 == v { print $2; exit }' <<<"$VERSION_LIST")
+  [[ -n $path ]] || return 1
+  printf '%s%s' "${CTXUP_SITE:-$CITRIX_SITE}" "$path"
+}
+
+# resolve_version WANT -> a published version. Call load_versions first.
+resolve_version() {
+  local want=${1:-latest}
+  if [[ $want == latest ]]; then
+    latest_version
+    return 0
+  fi
+  if version_page "$want" >/dev/null; then
+    printf '%s' "$want"
+    return 0
+  fi
+  err "Version $want is not published for Linux. Available versions:"
+  cut -d'|' -f1 <<<"$VERSION_LIST" | tr '\n' ' ' >&2
+  echo >&2
+  exit 1
+}
+
+PACKAGE_LIST=""
+
+# load_packages VERSION -> fills PACKAGE_LIST. The links carry a token that
+# expires after an hour, so call this right before downloading.
+load_packages() {
+  local version=$1 url page
+  url=$(version_page "$version") || die "No download page known for version $version."
+  info "Reading the download page for $version"
+  page=$(fetch "$url") || die "Could not load $url."
+  PACKAGE_LIST=$(parse_packages <<<"$page")
+  [[ -n $PACKAGE_LIST ]] || die "No download links found on $url. The page layout may have changed; please report it."
+}
+
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# download_package "file|url|sha" DESTDIR -> path of the verified file.
+download_package() {
+  local entry=$1 dest=$2 file url sum actual progress=(--silent --show-error)
+  IFS='|' read -r file url sum <<<"$entry"
+  [[ -t 2 ]] && progress=(--progress-bar)
+  info "Downloading $file"
+  curl --fail --location --retry 3 --retry-delay 5 --connect-timeout 20 \
+    --user-agent "ctxup/$CTXUP_VERSION" "${progress[@]}" \
+    --output "$dest/$file" "$url" ||
+    die "Download of $file failed."
+  if [[ -z $sum ]]; then
+    if [[ $OPT_NO_VERIFY -eq 1 ]]; then
+      warn "Citrix publishes no checksum for $file; continuing because of --no-verify."
+    else
+      rm -f -- "$dest/$file"
+      die "Citrix publishes no checksum for $file. Use --no-verify to install it anyway."
+    fi
+  else
+    actual=$(sha256_of "$dest/$file")
+    if [[ $actual != "$sum" ]]; then
+      rm -f -- "$dest/$file"
+      err "Checksum mismatch for $file"
+      err "  expected $sum"
+      err "  got      $actual"
+      exit 1
+    fi
+    ok "SHA-256 matches the value published by Citrix"
+  fi
+  printf '%s' "$dest/$file"
+}
+
+make_workdir() {
+  [[ -n $WORKDIR ]] && return 0
+  WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/ctxup.XXXXXXXX")
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+  load_versions
+  local n=0 version rest newest
+  newest=$(latest_version)
+  printf '%s  #  Version   Type%s\n' "$C_BOLD" "$C_RESET"
+  while IFS='|' read -r version rest; do
+    n=$((n + 1))
+    if [[ $version == "$newest" ]]; then
+      printf ' %2d  %-9s Current Release (latest)\n' "$n" "$version"
+    else
+      printf ' %2d  %-9s Current Release\n' "$n" "$version"
+    fi
+  done <<<"$VERSION_LIST"
+  echo
+  echo "Citrix publishes no LTSR for Linux; every Linux build is a Current Release."
+}
+
+cmd_download() {
+  require_supported_os
+  local version entry dest
+  load_versions
+  version=$(resolve_version "${OPT_VERSION:-latest}")
+  load_packages "$version"
+  entry=$(pick_package main <<<"$PACKAGE_LIST") ||
+    die "Version $version has no package for $(describe_os)."
+  dest=${OPT_DIR:-$PWD}
+  [[ -d $dest && -w $dest ]] || die "Cannot write to $dest."
+  download_package "$entry" "$dest" >/dev/null
+  ok "Saved to $dest/${entry%%|*}"
+}
+
+usage() {
+  cat <<EOF
+ctxup $CTXUP_VERSION - install, update and remove Citrix Workspace app on Linux
+
+Usage: ctxup <command> [options]
+
+Commands:
+  list        Show the versions Citrix publishes for Linux
+  download    Download and verify a package without installing it
+
+Options:
+  --version V   Version to use, e.g. 2608 or 2604.10 (default: latest)
+  --dir PATH    Where 'download' saves the package (default: current directory)
+  --no-verify   Accept a package Citrix publishes no checksum for
+  --force       Continue on a distribution release ctxup is not tested on
+  -y, --yes     Answer yes to questions
+  --no-color    Plain output
+  -h, --help    Show this help
+  -V            Show the ctxup version
+EOF
+}
+
+COMMAND=""
+
+parse_args() {
+  while (($#)); do
+    case $1 in
+      list | download)
+        [[ -z $COMMAND ]] || die "Only one command can be given (got '$COMMAND' and '$1')."
+        COMMAND=$1
+        ;;
+      --version)
+        [[ $# -ge 2 ]] || die "--version needs a value."
+        OPT_VERSION=$2
+        shift
+        ;;
+      --version=*) OPT_VERSION=${1#*=} ;;
+      --dir)
+        [[ $# -ge 2 ]] || die "--dir needs a value."
+        OPT_DIR=$2
+        shift
+        ;;
+      --dir=*) OPT_DIR=${1#*=} ;;
+      --no-verify) OPT_NO_VERIFY=1 ;;
+      --force) OPT_FORCE=1 ;;
+      -y | --yes) OPT_YES=1 ;;
+      --no-color) OPT_COLOR=0 ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -V)
+        echo "ctxup $CTXUP_VERSION"
+        exit 0
+        ;;
+      *) die "Unknown argument '$1'. Run 'ctxup --help'." ;;
+    esac
+    shift
+  done
+}
+
+main() {
+  parse_args "$@"
+  setup_colors
+  case $COMMAND in
+    list) cmd_list ;;
+    download) cmd_download ;;
+    "")
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

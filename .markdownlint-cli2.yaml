@@ -1,0 +1,10 @@
+config:
+  # Tables and URLs do not wrap well.
+  MD013: false
+  # The changelog repeats "Added", "Fixed" and so on under each release.
+  MD024:
+    siblings_only: true
+  # The pull request template starts with a second-level heading.
+  MD041: false
+ignores:
+  - tests/fixtures/**

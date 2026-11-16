@@ -1,0 +1,8 @@
+# Optional checks on top of the defaults.
+enable=add-default-case
+enable=avoid-nullary-conditions
+enable=check-unassigned-uppercase
+enable=deprecate-which
+enable=quote-safe-variables
+enable=require-double-brackets
+external-sources=true

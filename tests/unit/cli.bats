@@ -36,9 +36,9 @@ CTXUP="$BATS_TEST_DIRNAME/../../ctxup"
 }
 
 @test "unsupported distribution stops before anything is fetched" {
-  CTXUP_OS_RELEASE="$FIXTURES/os-release/fedora-45" run "$CTXUP" install --yes --accept-eula
+  CTXUP_OS_RELEASE="$FIXTURES/os-release/opensuse-15.6" run "$CTXUP" install --yes --accept-eula
   [ "$status" -ne 0 ]
-  [[ "$output" == *Fedora* ]]
+  [[ "$output" == *"not supported"* ]]
 }
 
 @test "untested release is refused without --force" {
@@ -75,4 +75,48 @@ CTXUP="$BATS_TEST_DIRNAME/../../ctxup"
   CTXUP_OS_RELEASE="$FIXTURES/os-release/rockylinux-9" run "$CTXUP" install --dry-run --device-trust
   [ "$status" -ne 0 ]
   [[ "$output" == *"--device-trust"* ]]
+}
+
+@test "check without an installation says so and returns 1" {
+  if [ -e /opt/Citrix/ICAClient ]; then skip "a client is installed on this machine"; fi
+  run "$CTXUP" check
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not installed"* ]]
+}
+
+@test "piping the script into bash runs it" {
+  run bash -c "bash -s -- -V < '$CTXUP'"
+  [ "$status" -eq 0 ]
+  [[ "$output" == ctxup\ * ]]
+}
+
+@test "--choose without a terminal is refused with a hint" {
+  if ! command -v curl >/dev/null; then skip "needs curl and network"; fi
+  CTXUP_OS_RELEASE="$FIXTURES/os-release/debian-12" CTXUP_INDEX_URL="file://$FIXTURES/pages/index.html" \
+    run "$CTXUP" install --dry-run --choose </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--version"* ]]
+}
+
+@test "the version list can be read from a saved page" {
+  if ! command -v curl >/dev/null; then skip "needs curl"; fi
+  CTXUP_INDEX_URL="file://$FIXTURES/pages/index.html" run "$CTXUP" list
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"2608      Current Release (latest)"* ]]
+  [[ "$output" == *"no LTSR for Linux"* ]]
+}
+
+@test "an unreachable index gives a clear error" {
+  if ! command -v curl >/dev/null; then skip "needs curl"; fi
+  CTXUP_FETCH_TRIES=1 CTXUP_INDEX_URL="file:///nonexistent/index.html" run "$CTXUP" list
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Could not reach"* ]]
+}
+
+@test "a page without Linux releases gives a clear error" {
+  if ! command -v curl >/dev/null; then skip "needs curl"; fi
+  echo '<html><a href="/x">Citrix Workspace app 2607 for Windows</a></html>' >"$BATS_TEST_TMPDIR/empty.html"
+  CTXUP_INDEX_URL="file://$BATS_TEST_TMPDIR/empty.html" run "$CTXUP" list
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"layout may have changed"* ]]
 }

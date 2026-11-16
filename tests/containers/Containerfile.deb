@@ -4,7 +4,7 @@ ARG BASE=docker.io/library/debian:12
 FROM ${BASE}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends systemd systemd-sysv dbus ca-certificates curl sudo \
+ && apt-get install -y --no-install-recommends systemd systemd-sysv dbus ca-certificates curl sudo util-linux \
  && rm -rf /var/lib/apt/lists/*
 RUN systemctl mask getty.target console-getty.service systemd-logind.service
 STOPSIGNAL SIGRTMIN+3

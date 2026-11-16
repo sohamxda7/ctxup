@@ -5,8 +5,9 @@ FIXTURES="$REPO_ROOT/tests/fixtures"
 load_ctxup() {
   # shellcheck source=../../ctxup
   source "$REPO_ROOT/ctxup"
-  set +eEu +o pipefail
-  trap - EXIT ERR
+  # Keep errexit on: bats needs it to notice a failing assertion. Only undo
+  # the two options that interfere with bats itself.
+  set +u +o pipefail
 }
 
 detect() {

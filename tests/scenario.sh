@@ -49,7 +49,29 @@ old_release() {
   fi
 }
 install_old() { old_release; }
-upgrade() { "$CTXUP" install --yes --accept-eula --from-file "$NEW" && [[ $(installed) == "$NEW_V" ]]; }
+# The upgrade is started by an ordinary user, so the switch to sudo is tested.
+upgrade_as_user() {
+  id tester >/dev/null 2>&1 || useradd -m tester
+  echo 'tester ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/tester
+  su tester -c "'$CTXUP' install --yes --accept-eula --from-file '$NEW'" || return 1
+  [[ $(installed) == "$NEW_V" ]] || return 1
+  # Installed files must be usable by everyone, whatever root's umask is.
+  su tester -c "test -x '$ICAROOT/wfica' && test -r '$ICAROOT/pkginf/Ver.core.linuxx64'"
+}
+check_when_absent() {
+  local out rc=0
+  out=$("$CTXUP" check 2>&1) || rc=$?
+  echo "$out"
+  [[ $rc -eq 1 ]] && grep -q "not installed" <<<"$out"
+}
+# Menu: check (nothing installed), back to the menu, list versions is not
+# needed here, quit. The menu has to be shown again after the check.
+menu_returns() {
+  local out
+  out=$(printf '3\n\nq\n' | script -qec "$CTXUP" /dev/null 2>&1) || true
+  echo "$out"
+  [[ $(grep -c "Choice:" <<<"$out") -ge 2 ]] && grep -q "nothing to check" <<<"$out"
+}
 repeat_is_noop() { "$CTXUP" install --yes --accept-eula --from-file "$NEW" 2>&1 | grep -q "Nothing to do"; }
 check() { "$CTXUP" check; }
 service_running() { systemctl is-active --quiet ctxcwalogd; }
@@ -87,8 +109,10 @@ purge_leaves_nothing() {
   return "$left"
 }
 
+step check-when-absent check_when_absent
+step menu-returns menu_returns
 step install-previous install_old
-step upgrade-to-latest upgrade
+step upgrade-as-user upgrade_as_user
 step repeat-is-noop repeat_is_noop
 step check check
 step service-running service_running

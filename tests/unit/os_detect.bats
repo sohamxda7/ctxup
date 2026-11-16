@@ -43,11 +43,8 @@ check() { # fixture family base version
   [[ "$OS_PROBLEM" == *"outside the tested range"* ]]
 }
 
-@test "Fedora is rejected with a reason" {
-  detect fedora-45
-  [ -z "$OS_FAMILY" ]
-  [[ "$OS_PROBLEM" == *Fedora* ]]
-}
+@test "Fedora 45" { check fedora-45 rpm fedora 45; }
+@test "Fedora 44" { check fedora-44 rpm fedora 44; }
 
 @test "openSUSE is rejected" {
   detect opensuse-15.6

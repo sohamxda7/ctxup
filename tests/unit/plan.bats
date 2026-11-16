@@ -42,11 +42,12 @@ setup() { load_ctxup; }
   [ "$(plan_action deb "" deb 26.08.0.225)" = replace ]
 }
 
-@test "install method: deb family, RHEL 8/9 rpm, RHEL 10 tarball" {
+@test "install method: deb family, RHEL 8/9 rpm, RHEL 10 and Fedora tarball" {
   detect ubuntu-24.04 && [ "$(install_method_for_os)" = deb ]
   detect rockylinux-8 && [ "$(install_method_for_os)" = rpm ]
   detect almalinux-9 && [ "$(install_method_for_os)" = rpm ]
   detect rockylinux-10 && [ "$(install_method_for_os)" = tarball ]
+  detect fedora-45 && [ "$(install_method_for_os)" = tarball ]
 }
 
 @test "deb package names are derived from library names" {
@@ -110,4 +111,18 @@ HINST
   echo 'echo something else' >"$file"
   run patch_hinst "$file"
   [ "$status" -ne 0 ]
+}
+
+@test "free space is reported in megabytes" {
+  mb=$(free_mb /)
+  [[ "$mb" =~ ^[0-9]+$ ]]
+  [ "$(free_mb /nonexistent/deeper/path)" = "$mb" ]
+}
+
+@test "need_space stops when there is not enough room" {
+  run need_space / 999999999 "the test"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Not enough disk space"* ]]
+  run need_space / 1 "the test"
+  [ "$status" -eq 0 ]
 }

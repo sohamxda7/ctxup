@@ -3,6 +3,7 @@
 load helper
 
 setup() {
+  command -v curl >/dev/null || skip "needs curl"
   load_ctxup
   SRC="$BATS_TEST_TMPDIR/src"
   DEST="$BATS_TEST_TMPDIR/dest"

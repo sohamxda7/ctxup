@@ -2,8 +2,10 @@
 # package scripts that enable services behave as they do on a real machine.
 ARG BASE=quay.io/rockylinux/rockylinux:9
 FROM ${BASE}
-RUN dnf install -y --allowerasing systemd sudo curl ca-certificates \
+RUN dnf install -y --allowerasing systemd sudo curl ca-certificates util-linux shadow-utils \
  && dnf clean all
+# Fedora ships script(1), which the menu test needs, in its own package.
+RUN if [ -f /etc/fedora-release ]; then dnf install -y util-linux-script && dnf clean all; fi
 RUN systemctl mask getty.target console-getty.service systemd-logind.service
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

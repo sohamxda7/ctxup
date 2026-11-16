@@ -34,6 +34,8 @@ rocky-10|quay.io/rockylinux/rockylinux:10|tarball|ok
 alma-8|docker.io/library/almalinux:8|rpm|ok
 alma-9|docker.io/library/almalinux:9|rpm|ok
 alma-10|docker.io/library/almalinux:10|tarball|ok
+fedora-44|docker.io/library/fedora:44|tarball|ok
+fedora-45|docker.io/library/fedora:45|tarball|ok
 '
 
 if [[ ${1:-} == -j ]]; then

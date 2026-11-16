@@ -30,6 +30,18 @@ OPT_FORCE=0
 OPT_NO_VERIFY=0
 OPT_COLOR=1
 OPT_DIR=""
+OPT_FROM_FILE=""
+OPT_CLEAN=0
+OPT_PURGE=0
+OPT_DRY_RUN=0
+OPT_CERTS=1
+OPT_USB=0
+OPT_APP_PROTECTION=0
+OPT_DEVICE_TRUST=0
+OPT_EPA=0
+
+LOG_FILE="${CTXUP_LOG:-/var/log/ctxup.log}"
+ORIG_ARGS=()
 
 # Filled in by detect_os.
 OS_FAMILY="" # deb | rpm
@@ -417,7 +429,880 @@ make_workdir() {
 }
 
 # ---------------------------------------------------------------------------
-# Commands
+# Running things as root
+# ---------------------------------------------------------------------------
+
+need_root() {
+  [[ $EUID -eq 0 ]] && return 0
+  if have sudo && [[ -f $0 && -r $0 ]]; then
+    info "This step needs root, re-running with sudo."
+    exec sudo -- "$BASH" "$0" "${ORIG_ARGS[@]}"
+  fi
+  die "This command must be run as root."
+}
+
+# run_logged DESCRIPTION CMD... -> runs CMD with its output appended to the log.
+run_logged() {
+  local what=$1 rc=0
+  shift
+  {
+    printf '\n### %s  %s\n### %s\n' "$(date '+%F %T')" "$what" "$*"
+  } >>"$LOG_FILE" 2>/dev/null || LOG_FILE=/dev/null
+  "$@" >>"$LOG_FILE" 2>&1 </dev/null || rc=$?
+  return "$rc"
+}
+
+show_log_tail() {
+  [[ $LOG_FILE == /dev/null ]] && return 0
+  err "Last lines of $LOG_FILE:"
+  tail -n 25 "$LOG_FILE" | sed 's/^/    /' >&2
+}
+
+systemd_running() { [[ -d /run/systemd/system ]] && have systemctl; }
+
+# ---------------------------------------------------------------------------
+# What is installed right now
+# ---------------------------------------------------------------------------
+
+# install_method_for_os -> deb | rpm | tarball
+# RHEL 10 has no WebKitGTK 4.0, which the RPM is built against, so the
+# tarball (built against 4.1) is used there.
+install_method_for_os() {
+  if [[ $OS_FAMILY == deb ]]; then
+    echo deb
+  elif [[ $OS_BASE_VER -ge 10 ]]; then
+    echo tarball
+  else
+    echo rpm
+  fi
+}
+
+deb_installed() {
+  have dpkg-query || return 1
+  [[ $(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null) == installed ]]
+}
+
+rpm_installed() { have rpm && rpm -q "$1" >/dev/null 2>&1; }
+
+# installed_method -> deb | rpm | tarball | none
+installed_method() {
+  if deb_installed icaclient; then
+    echo deb
+  elif rpm_installed ICAClient; then
+    echo rpm
+  elif [[ -e $ICAROOT/wfica || -e $ICAROOT/setupwfc ]]; then
+    echo tarball
+  else
+    echo none
+  fi
+}
+
+# installed_version -> 26.08.0.225, or nothing
+installed_version() {
+  local file version=""
+  for file in "$ICAROOT"/pkginf/Ver.core.linux*; do
+    [[ -r $file ]] || continue
+    version=$(sed -n 's/^ID_VERSION=//p' "$file" | head -n1)
+    [[ -n $version ]] && break
+  done
+  if [[ -z $version ]]; then
+    if deb_installed icaclient; then
+      version=$(dpkg-query -W -f='${Version}' icaclient 2>/dev/null)
+    elif rpm_installed ICAClient; then
+      version=$(rpm -q --qf '%{VERSION}' ICAClient 2>/dev/null)
+    fi
+  fi
+  printf '%s' "$version"
+}
+
+app_protection_installed() {
+  rpm_installed ctxappprotection && return 0
+  compgen -G '/usr/lib/systemd/system/AppProtectionService*' >/dev/null && return 0
+  compgen -G '/etc/systemd/system/AppProtectionService*' >/dev/null && return 0
+  return 1
+}
+
+# version_cmp A B -> prints lt, eq or gt
+version_cmp() {
+  if [[ $1 == "$2" ]]; then
+    echo eq
+  elif [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1) == "$1" ]]; then
+    echo lt
+  else
+    echo gt
+  fi
+}
+
+# plan_action INSTALLED_METHOD INSTALLED_VERSION TARGET_METHOD TARGET_VERSION
+#   -> install | upgrade | replace | reinstall | downgrade
+# "replace" means the old copy has to be removed first.
+plan_action() {
+  local have_method=$1 have_version=$2 want_method=$3 want_version=$4
+  if [[ $have_method == none ]]; then
+    echo install
+    return
+  fi
+  if [[ $have_method != "$want_method" || -z $have_version ]]; then
+    echo replace
+    return
+  fi
+  case $(version_cmp "$have_version" "$want_version") in
+    eq) echo reinstall ;;
+    gt) echo downgrade ;;
+    lt)
+      # The tarball installer refuses to overwrite without a prompt.
+      if [[ $want_method == tarball ]]; then echo replace; else echo upgrade; fi
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Library checks
+# ---------------------------------------------------------------------------
+
+# scan_missing -> "file soname" for every shared library the client cannot find.
+scan_missing() {
+  [[ -d $ICAROOT ]] || return 0
+  (
+    cd "$ICAROOT" || exit 0
+    for file in wfica selfservice AuthManagerDaemon ServiceRecord UtilDaemon \
+      util/storebrowse lib/*.so lib/*/*.so ./*.DLL; do
+      [[ -f $file ]] || continue
+      LD_LIBRARY_PATH="$ICAROOT/lib:$ICAROOT" ldd "$file" 2>/dev/null |
+        awk -v f="${file#./}" '/=> not found/ { print f, $1 }'
+    done
+  ) | sort -u
+}
+
+# Files a session cannot start without.
+is_core_file() {
+  case $1 in
+    wfica | AuthManagerDaemon | ServiceRecord | UtilDaemon | util/storebrowse | lib/UIDialogLib3.so) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The self-service window (the "Citrix Workspace" app with the store UI).
+# Sessions started from a browser do not need it.
+is_selfservice_file() {
+  case $1 in
+    selfservice | lib/UIDialogLibWebKit3* | lib/*_ext/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+feature_of() {
+  case $1 in
+    VDSCAN.DLL) echo "scanner redirection" ;;
+    VDMTCH.DLL) echo "multi-touch" ;;
+    VDHSSPI.DLL | lib/libkcph.so) echo "Kerberos single sign-on" ;;
+    lib/libbgblur.so | lib/libctxbeffect.so) echo "webcam background effects" ;;
+    AUDPULSE.DLL) echo "PulseAudio output" ;;
+    SPEEX.DLL | VORBIS.DLL) echo "legacy audio codecs" ;;
+    lib/libGnomeKeeper.so) echo "saved credentials (libsecret)" ;;
+    VDFIDO.DLL) echo "FIDO2" ;;
+    VDWEBRTC.DLL) echo "Microsoft Teams optimisation" ;;
+    *) echo "optional component" ;;
+  esac
+}
+
+# deb_candidates SONAME -> package names that may ship it, best guess first.
+deb_candidates() {
+  local soname=$1 base major name
+  case $soname in
+    libgdk-3.so.0 | libgtk-3.so.0) echo "libgtk-3-0t64 libgtk-3-0" ;;
+    libgstreamer-1.0.so.0) echo "libgstreamer1.0-0" ;;
+    libgst*-1.0.so.0) echo "libgstreamer-plugins-base1.0-0" ;;
+    libsoup-2.4.so.1) echo "libsoup-2.4-1 libsoup2.4-1" ;;
+    libgssapi.so.3) echo "libgssapi3t64-heimdal libgssapi3-heimdal" ;;
+    libopencv_*) ;; # tied to one exact OpenCV release, cannot be satisfied in general
+    *.so.*)
+      # Debian naming rule: libfoo.so.1 -> libfoo1, libfoo-2.so.0 -> libfoo-2-0
+      base=${soname%%.so.*}
+      major=${soname##*.so.}
+      major=${major%%.*}
+      if [[ $base =~ [0-9]$ ]]; then name="$base-$major"; else name="$base$major"; fi
+      name=${name,,}
+      name=${name//_/-}
+      echo "${name}t64 $name"
+      ;;
+  esac
+}
+
+apt_has() {
+  local policy
+  policy=$(apt-cache policy "$1" 2>/dev/null) || return 1
+  grep -qE '^ +Candidate: +[^( ]' <<<"$policy"
+}
+
+# install_missing_libs -> installs distribution packages for unresolved sonames.
+install_missing_libs() {
+  local sonames soname candidate packages=()
+  sonames=$(scan_missing | awk '{ print $2 }' | sort -u)
+  [[ -n $sonames ]] || return 0
+  if [[ $OS_FAMILY == deb ]]; then
+    while read -r soname; do
+      for candidate in $(deb_candidates "$soname"); do
+        if apt_has "$candidate"; then
+          packages+=("$candidate")
+          break
+        fi
+      done
+    done <<<"$sonames"
+    ((${#packages[@]})) || return 0
+    info "Installing ${#packages[@]} extra libraries the client links against"
+    run_logged "extra libraries" apt-get install -y --no-install-recommends "${packages[@]}" ||
+      warn "Some extra libraries could not be installed; see $LOG_FILE."
+  else
+    info "Installing extra libraries the client links against"
+    while read -r soname; do
+      run_logged "library $soname" dnf install -y "${soname}()(64bit)" || true
+    done <<<"$sonames"
+  fi
+}
+
+# report_libs -> prints the result of the library scan; returns 1 when the
+# session client itself has an unresolved library.
+report_libs() {
+  local missing file soname core="" selfservice="" optional="" rc=0
+  missing=$(scan_missing)
+  while read -r file soname; do
+    [[ -n $file ]] || continue
+    if is_core_file "$file"; then
+      core+="    $file needs $soname"$'\n'
+    elif is_selfservice_file "$file"; then
+      selfservice+="$soname"$'\n'
+    else
+      optional+="$soname|$(feature_of "$file")"$'\n'
+    fi
+  done <<<"$missing"
+  if [[ -n $core ]]; then
+    err "Libraries the session client needs are missing:"
+    printf '%s' "$core" >&2
+    rc=1
+  else
+    ok "All libraries needed by the session client (wfica) and its helper daemons are present"
+  fi
+  if [[ -n $selfservice ]]; then
+    warn "The self-service window will not start; these libraries are missing:"
+    printf '%s' "$selfservice" | sort -u | sed 's/^/    /' >&2
+    if grep -q 'webkit2gtk-4\.0' <<<"$selfservice"; then
+      warn "This release was built against WebKitGTK 4.0, which $(describe_os) does not ship."
+      warn "Sessions opened from a browser (.ica files) still work. Release 2608 or newer uses WebKitGTK 4.1."
+    fi
+  elif [[ -z $core ]]; then
+    ok "All libraries needed by the self-service window are present"
+  fi
+  if [[ -n $optional ]]; then
+    warn "Optional features with a missing library:"
+    # One line per library, listing the features that use it.
+    printf '%s' "$optional" | sort -u | awk -F'|' '
+      $1 != last { if (last != "") printf "    %-30s %s\n", last, uses; last = $1; uses = $2; next }
+      { uses = uses ", " $2 }
+      END { if (last != "") printf "    %-30s %s\n", last, uses }
+    ' >&2
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Certificates
+# ---------------------------------------------------------------------------
+
+# The client only trusts certificates in its own keystore, which ships with
+# a short list. Add the system store so sites signed by other public or
+# company CAs do not fail with "SSL error 61".
+link_system_certs() {
+  local store="$ICAROOT/keystore/cacerts" bundle count=0 cert
+  [[ -d $store ]] || return 0
+  find "$store" -maxdepth 1 -name 'ctxup-*.pem' -delete 2>/dev/null || true
+  if compgen -G '/etc/ssl/certs/*.pem' >/dev/null && [[ ! -e /etc/pki/tls/certs/ca-bundle.crt ]]; then
+    for cert in /etc/ssl/certs/*.pem; do
+      [[ -e $cert ]] || continue
+      ln -sf "$(readlink -f "$cert")" "$store/ctxup-$(basename "$cert")"
+      count=$((count + 1))
+    done
+  else
+    bundle=/etc/pki/tls/certs/ca-bundle.crt
+    [[ -r $bundle ]] || bundle=/etc/ssl/certs/ca-certificates.crt
+    [[ -r $bundle ]] || return 0
+    awk -v dir="$store" '
+      /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/ctxup-%04d.pem", dir, n) }
+      out != "" { print > out }
+      /-----END CERTIFICATE-----/ { close(out); out = "" }
+    ' "$bundle"
+    count=$(find "$store" -maxdepth 1 -name 'ctxup-*.pem' | wc -l)
+  fi
+  if [[ -x $ICAROOT/util/ctx_rehash ]]; then
+    run_logged "ctx_rehash" "$ICAROOT/util/ctx_rehash" || warn "ctx_rehash failed; see $LOG_FILE."
+  fi
+  ok "Added $count system CA certificates to the client keystore"
+}
+
+# ---------------------------------------------------------------------------
+# Installing
+# ---------------------------------------------------------------------------
+
+yesno() { if [[ $1 -eq 1 ]]; then echo yes; else echo no; fi; }
+
+accept_eula() {
+  [[ $OPT_ACCEPT_EULA -eq 1 ]] && return 0
+  echo >&2
+  echo "Citrix Workspace app is proprietary software. Using it means accepting" >&2
+  echo "the Citrix licence agreement:" >&2
+  echo "  $EULA_URL" >&2
+  echo >&2
+  if [[ ! -t 0 ]]; then
+    die "The licence has to be accepted. Re-run with --accept-eula."
+  fi
+  local reply
+  read -r -p "Do you accept the Citrix licence agreement? [y/N] " reply || reply=""
+  case ${reply,,} in
+    y | yes) return 0 ;;
+    *) die "Licence not accepted, nothing was installed." ;;
+  esac
+}
+
+install_deb() {
+  local package=$1 usb=${2:-} files=("$1")
+  [[ -n $usb ]] && files+=("$usb")
+  export DEBIAN_FRONTEND=noninteractive
+  info "Refreshing the package index"
+  run_logged "apt-get update" apt-get update ||
+    warn "apt-get update reported errors; continuing with the existing index."
+  # The package asks three questions through debconf. Answer them up front.
+  printf 'icaclient %s select %s\n' \
+    app_protection/install_app_protection "$(yesno "$OPT_APP_PROTECTION")" \
+    devicetrust/install_devicetrust "$(yesno "$OPT_DEVICE_TRUST")" \
+    epa/install_epa "$(yesno "$OPT_EPA")" |
+    debconf-set-selections >>"$LOG_FILE" 2>&1 ||
+    warn "Could not pre-answer the package questions."
+  info "Installing ${package##*/} and its dependencies (log: $LOG_FILE)"
+  # psmisc and procps are used by the package's own scripts.
+  run_logged "install package" apt-get install -y --no-install-recommends \
+    --allow-downgrades psmisc procps ca-certificates xdg-utils "${files[@]}" || {
+    show_log_tail
+    die "The package manager could not install the client."
+  }
+  install_missing_libs
+  local extras=() name
+  for name in gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-libav libcanberra-gtk3-module; do
+    apt_has "$name" && extras+=("$name")
+  done
+  if ((${#extras[@]})); then
+    info "Installing multimedia plugins recommended by Citrix"
+    run_logged "multimedia plugins" apt-get install -y --no-install-recommends "${extras[@]}" ||
+      warn "Multimedia plugins could not be installed; HDX multimedia redirection may not work."
+  fi
+}
+
+# Releases before 2608 create /etc/init.d as a plain directory when chkconfig
+# is absent. The chkconfig package, which 2608 requires, ships /etc/init.d as
+# a symlink and cannot be installed over that directory. Move the directory
+# out of the way, install chkconfig, then put the scripts back.
+prepare_initd() {
+  rpm_installed chkconfig && return 0
+  [[ -d /etc/init.d && ! -L /etc/init.d ]] || return 0
+  local saved
+  saved=$(mktemp -d /etc/init.d.ctxup.XXXXXX)
+  if compgen -G '/etc/init.d/*' >/dev/null; then
+    mv /etc/init.d/* "$saved"/
+  fi
+  rmdir /etc/init.d
+  run_logged "install chkconfig" dnf install -y chkconfig || true
+  mkdir -p /etc/init.d
+  if compgen -G "$saved/*" >/dev/null; then
+    mv "$saved"/* /etc/init.d/
+  fi
+  rmdir "$saved"
+}
+
+install_rpm() {
+  local package=$1 files=("$1")
+  shift
+  files+=("$@")
+  prepare_initd
+  info "Installing ${package##*/} and its dependencies (log: $LOG_FILE)"
+  run_logged "install package" dnf install -y psmisc which findutils xdg-utils "${files[@]}" || {
+    show_log_tail
+    die "The package manager could not install the client."
+  }
+  install_missing_libs
+}
+
+# enable_epel -> makes EPEL available; RHEL 10 needs it for WebKitGTK 4.1.
+enable_epel() {
+  local repos
+  repos=$(dnf -q repolist --enabled 2>/dev/null) || repos=""
+  if grep -qiE '^epel\b' <<<"$repos"; then
+    return 0
+  fi
+  ask "WebKitGTK 4.1 comes from the EPEL repository on RHEL $OS_BASE_VER. Enable EPEL?" y ||
+    die "EPEL is required on RHEL $OS_BASE_VER."
+  info "Enabling EPEL"
+  run_logged "epel-release" dnf install -y epel-release ||
+    run_logged "epel-release (upstream)" dnf install -y \
+      "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${OS_BASE_VER}.noarch.rpm" || {
+    show_log_tail
+    die "Could not enable EPEL."
+  }
+  # EPEL packages depend on CodeReady Builder. The command differs between
+  # RHEL and its rebuilds, so try both and carry on if neither applies.
+  run_logged "enable crb" dnf config-manager --set-enabled crb ||
+    run_logged "enable codeready-builder" subscription-manager repos \
+      --enable "codeready-builder-for-rhel-${OS_BASE_VER}-$(uname -m)-rpms" || true
+}
+
+# patch_hinst FILE -> makes Citrix's tarball installer usable without a
+# terminal: yes/no questions take their default, except the two "proceed"
+# confirmations (install and remove), which are answered yes.
+patch_hinst() {
+  local file=$1
+  # shellcheck disable=SC2016  # the dollar signs belong to Citrix's script
+  sed -i -E \
+    -e '/^getyesno\(\)\{/,/^\}/ s/^([[:space:]]*)read response$/\1response=/' \
+    -e '/\$instica4/,/getyesno/ s/getyesno \$INSTALLER_NO/ANSWER=$INSTALLER_YES/' \
+    -e '/\$instica9c/,/getyesno/ s/getyesno \$INSTALLER_NO/ANSWER=$INSTALLER_YES/' \
+    "$file"
+  # shellcheck disable=SC2016
+  grep -q 'ANSWER=\$INSTALLER_YES' "$file"
+}
+
+install_tarball() {
+  local archive=$1 dir="$WORKDIR/tarball"
+  enable_epel
+  info "Installing the libraries the client needs (log: $LOG_FILE)"
+  run_logged "tarball dependencies" dnf install -y tar gzip which findutils psmisc xdg-utils \
+    gtk3 webkit2gtk4.1 libXmu libXpm libXt libXinerama libXrender libpng libva \
+    speexdsp sqlite-libs libsecret libxkbcommon || {
+    show_log_tail
+    die "Could not install the required libraries."
+  }
+  mkdir -p "$dir"
+  tar -xzf "$archive" -C "$dir" || die "Could not unpack ${archive##*/}."
+  [[ -x $dir/setupwfc && -f $dir/linuxx64/hinst ]] ||
+    die "${archive##*/} does not look like a Citrix Workspace tarball."
+  patch_hinst "$dir/linuxx64/hinst" ||
+    die "Citrix changed its tarball installer and ctxup cannot drive it. Please report this."
+  info "Running the Citrix installer"
+  # Menu: 1 = install, <enter> = default directory, 3 = quit.
+  (cd "$dir" && printf '1\n\n3\n' | TERM=dumb ./setupwfc) >>"$LOG_FILE" 2>&1 || true
+  if [[ ! -x $ICAROOT/wfica ]]; then
+    show_log_tail
+    die "The Citrix installer did not complete."
+  fi
+  install_missing_libs
+}
+
+extras_not_supported() {
+  local method=$1 unsupported=()
+  if [[ $method == tarball ]]; then
+    [[ $OPT_USB -eq 1 ]] && unsupported+=("--with-usb")
+    [[ $OPT_APP_PROTECTION -eq 1 ]] && unsupported+=("--app-protection")
+  fi
+  if [[ $method != deb ]]; then
+    [[ $OPT_DEVICE_TRUST -eq 1 ]] && unsupported+=("--device-trust")
+    [[ $OPT_EPA -eq 1 ]] && unsupported+=("--epa")
+  fi
+  ((${#unsupported[@]})) || return 0
+  die "${unsupported[*]} cannot be used on $(describe_os): Citrix offers no unattended way to install it there."
+}
+
+# kind_for_method deb|rpm|tarball -> package kind to look up on the page
+kind_for_method() { if [[ $1 == tarball ]]; then echo tarball; else echo main; fi; }
+
+check_from_file() {
+  local method=$1 file=$2
+  [[ -r $file ]] || die "Cannot read $file."
+  case $method:$file in
+    deb:*.deb | rpm:*.rpm | tarball:*.tar.gz) ;;
+    deb:*) die "$(describe_os) needs a .deb package, got ${file##*/}." ;;
+    rpm:*) die "$(describe_os) needs the RedHat .rpm package, got ${file##*/}." ;;
+    *) die "$(describe_os) needs the linuxx64 .tar.gz package, got ${file##*/}." ;;
+  esac
+}
+
+cmd_install() {
+  require_supported_os
+  local method target_version="" entry="" usb_entry="" ap_entry=""
+  local have_method have_version action package usb_file="" ap_file=""
+  method=$(install_method_for_os)
+  extras_not_supported "$method"
+
+  if [[ -n $OPT_FROM_FILE ]]; then
+    check_from_file "$method" "$OPT_FROM_FILE"
+    target_version=$(full_version "${OPT_FROM_FILE##*/}")
+    [[ -n $target_version ]] || die "Cannot read a version number from ${OPT_FROM_FILE##*/}."
+    if [[ $OPT_USB -eq 1 || ($OPT_APP_PROTECTION -eq 1 && $method == rpm) ]]; then
+      die "--with-usb and --app-protection need a download and cannot be combined with --from-file."
+    fi
+  else
+    local version
+    load_versions
+    version=$(resolve_version "${OPT_VERSION:-latest}")
+    load_packages "$version"
+    entry=$(pick_package "$(kind_for_method "$method")" <<<"$PACKAGE_LIST") ||
+      die "Version $version has no package for $(describe_os)."
+    target_version=$(full_version "${entry%%|*}")
+    if [[ $OPT_USB -eq 1 ]]; then
+      usb_entry=$(pick_package usb <<<"$PACKAGE_LIST") ||
+        die "Version $version has no USB package for $(describe_os)."
+    fi
+    if [[ $OPT_APP_PROTECTION -eq 1 && $method == rpm ]]; then
+      ap_entry=$(pick_package appprotection <<<"$PACKAGE_LIST") ||
+        die "Version $version has no App Protection package for $(describe_os)."
+    fi
+  fi
+
+  have_method=$(installed_method)
+  have_version=$(installed_version)
+  action=$(plan_action "$have_method" "$have_version" "$method" "$target_version")
+  [[ $OPT_CLEAN -eq 1 && $action != install ]] && action=replace
+
+  echo >&2
+  echo "  System:     $(describe_os)" >&2
+  if [[ $have_method == none ]]; then
+    echo "  Installed:  nothing" >&2
+  else
+    echo "  Installed:  ${have_version:-unknown version} ($have_method)" >&2
+  fi
+  echo "  To install: $target_version ($method)" >&2
+  echo >&2
+
+  case $action in
+    install) ;;
+    upgrade)
+      if app_protection_installed; then
+        warn "App Protection is installed. Citrix does not support upgrading over it,"
+        warn "so the current copy will be removed first. Reboot afterwards."
+        action=replace
+      else
+        info "Upgrading $have_version to $target_version in place. Settings are kept."
+      fi
+      ;;
+    reinstall)
+      if [[ $OPT_CLEAN -eq 0 ]]; then
+        # Unattended runs stay idempotent; --clean forces a reinstall.
+        if [[ $OPT_YES -eq 1 || ! -t 0 ]] ||
+          ! ask "Version $target_version is already installed. Reinstall it?" n; then
+          ok "Version $target_version is already installed. Nothing to do (use --clean to reinstall)."
+          return 0
+        fi
+      fi
+      action=replace
+      ;;
+    downgrade)
+      warn "The installed version ($have_version) is newer than $target_version."
+      ask "Remove it and install the older version?" n || die "Cancelled."
+      action=replace
+      ;;
+    replace)
+      if [[ $have_method != "$method" ]]; then
+        warn "The existing copy was installed another way ($have_method). Citrix does not"
+        warn "support mixing installation methods, so it has to be removed first."
+      fi
+      ask "Remove the installed copy before installing $target_version? Settings in home directories are kept." y ||
+        die "Cancelled."
+      ;;
+  esac
+
+  if [[ $OPT_APP_PROTECTION -eq 1 ]]; then
+    warn "App Protection cannot be switched off later. Removing it means uninstalling the client."
+  fi
+
+  if [[ $OPT_DRY_RUN -eq 1 ]]; then
+    info "Dry run: would $action $target_version using the $method package${entry:+ ${entry%%|*}}."
+    return 0
+  fi
+
+  accept_eula
+  need_root
+  make_workdir
+
+  if [[ -n $OPT_FROM_FILE ]]; then
+    package="$WORKDIR/${OPT_FROM_FILE##*/}"
+    cp -- "$OPT_FROM_FILE" "$package"
+  else
+    package=$(download_package "$entry" "$WORKDIR")
+    [[ -n $usb_entry ]] && usb_file=$(download_package "$usb_entry" "$WORKDIR")
+    [[ -n $ap_entry ]] && ap_file=$(download_package "$ap_entry" "$WORKDIR")
+  fi
+  # apt and dnf drop privileges to read local packages.
+  chmod 755 "$WORKDIR"
+  chmod 644 "$WORKDIR"/*.* 2>/dev/null || true
+
+  if [[ $action == replace ]]; then
+    remove_client 0
+  fi
+
+  case $method in
+    deb) install_deb "$package" "$usb_file" ;;
+    rpm)
+      local extra=()
+      [[ -n $usb_file ]] && extra+=("$usb_file")
+      [[ -n $ap_file ]] && extra+=("$ap_file")
+      install_rpm "$package" "${extra[@]}"
+      ;;
+    tarball) install_tarball "$package" ;;
+  esac
+
+  [[ $OPT_CERTS -eq 1 ]] && link_system_certs
+
+  local now
+  now=$(installed_version)
+  if [[ $now != "$target_version" ]]; then
+    die "Installation finished but the installed version reads '${now:-none}', expected $target_version."
+  fi
+  ok "Citrix Workspace app $now is installed"
+
+  if ! systemd_running; then
+    warn "systemd is not running here, so the Citrix background services were not started."
+  fi
+  if app_protection_installed; then
+    warn "App Protection is installed: reboot before using the client."
+  fi
+  report_libs || die "The client is installed but sessions will not start until the libraries above are available."
+  echo >&2
+  echo "Start it from the application menu, or open a .ica file from your Citrix portal." >&2
+  echo "Run 'ctxup check' for a full report." >&2
+}
+
+# ---------------------------------------------------------------------------
+# Removing
+# ---------------------------------------------------------------------------
+
+# human_homes -> home directories of root, the invoking user and regular users
+human_homes() {
+  {
+    getent passwd | awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 60000)) && $6 != "" { print $6 }'
+    if [[ -n ${SUDO_USER:-} ]]; then
+      getent passwd "$SUDO_USER" | cut -d: -f6
+    fi
+  } | sort -u
+}
+
+remove_tarball() {
+  local hinst="$ICAROOT/util/hinst"
+  if [[ -x $ICAROOT/setupwfc && -f $hinst ]] && patch_hinst "$hinst"; then
+    # Menu: 2 = remove, <enter> = default directory, 3 = quit.
+    (cd / && printf '2\n\n3\n' | TERM=dumb "$ICAROOT/setupwfc") >>"$LOG_FILE" 2>&1 || true
+  fi
+}
+
+# remove_client PURGE(0|1) -> removes the client and what it leaves behind.
+remove_client() {
+  local purge=$1 method packages=() name home
+  method=$(installed_method)
+  info "Removing the installed client"
+  case $method in
+    deb)
+      for name in icaclient ctxusb ctxbcr; do
+        deb_installed "$name" && packages+=("$name")
+      done
+      export DEBIAN_FRONTEND=noninteractive
+      if [[ $purge -eq 1 ]]; then
+        run_logged "purge packages" apt-get purge -y "${packages[@]}" || true
+      else
+        run_logged "remove packages" apt-get remove -y "${packages[@]}" || true
+      fi
+      if deb_installed icaclient; then
+        show_log_tail
+        die "The package manager could not remove icaclient."
+      fi
+      ;;
+    rpm)
+      for name in ctxappprotection ctxusb ICAClient; do
+        rpm_installed "$name" && packages+=("$name")
+      done
+      run_logged "remove packages" dnf remove -y "${packages[@]}" || true
+      if rpm_installed ICAClient; then
+        show_log_tail
+        die "The package manager could not remove ICAClient."
+      fi
+      ;;
+    tarball) remove_tarball ;;
+  esac
+
+  # A removed .deb keeps its configuration record until it is purged.
+  if [[ $purge -eq 1 ]] && have dpkg-query; then
+    packages=()
+    for name in icaclient ctxusb ctxbcr; do
+      if [[ $(dpkg-query -W -f='${db:Status-Status}' "$name" 2>/dev/null) == config-files ]]; then
+        packages+=("$name")
+      fi
+    done
+    if ((${#packages[@]})); then
+      run_logged "purge package records" dpkg --purge "${packages[@]}" || true
+    fi
+  fi
+
+  # Things the packages and the tarball installer leave behind.
+  if systemd_running; then
+    for name in ctxcwalogd ctxusbd; do
+      systemctl stop "$name" >/dev/null 2>&1 || true
+      systemctl disable "$name" >/dev/null 2>&1 || true
+    done
+  fi
+  rm -f /etc/init.d/ctxcwalogd /etc/systemd/system/ctxcwalogd.service \
+    /etc/systemd/system/ctxusbd.service /lib/systemd/system/ctxcwalogd.service \
+    /usr/lib/systemd/system/ctxcwalogd.service
+  if systemd_running; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$ICAROOT"
+  rmdir /opt/Citrix 2>/dev/null || true
+  # On RPM systems the Citrix scripts may have created /etc/init.d themselves.
+  if [[ $OS_FAMILY == rpm && -d /etc/init.d && ! -L /etc/init.d ]]; then
+    rmdir /etc/init.d 2>/dev/null || true
+  fi
+
+  if [[ $purge -eq 1 ]]; then
+    rm -rf /etc/icaclient /var/log/citrix
+    while read -r home; do
+      if [[ -d $home/.ICAClient ]]; then
+        rm -rf -- "$home/.ICAClient"
+      fi
+    done < <(human_homes)
+    if id citrixlog >/dev/null 2>&1; then
+      run_logged "remove citrixlog user" userdel citrixlog || true
+    fi
+  fi
+  return 0
+}
+
+cmd_uninstall() {
+  detect_os
+  local method version home found=0
+  method=$(installed_method)
+  version=$(installed_version)
+  if [[ $method == none && $OPT_PURGE -eq 0 ]]; then
+    ok "Citrix Workspace app is not installed."
+    return 0
+  fi
+  if [[ $method != none ]]; then
+    echo "This will remove Citrix Workspace app ${version:-} ($method) from $ICAROOT." >&2
+  fi
+  if [[ $OPT_PURGE -eq 1 ]]; then
+    echo "With --purge it also removes:" >&2
+    echo "  /etc/icaclient, /var/log/citrix and the citrixlog system user" >&2
+    while read -r home; do
+      if [[ -d $home/.ICAClient ]]; then
+        echo "  $home/.ICAClient" >&2
+        found=1
+      fi
+    done < <(human_homes)
+    [[ $found -eq 0 ]] && echo "  (no per-user settings found)" >&2
+  else
+    echo "Per-user settings in ~/.ICAClient are kept. Use --purge to remove them too." >&2
+  fi
+  if [[ $OPT_DRY_RUN -eq 1 ]]; then
+    info "Dry run: nothing was removed."
+    return 0
+  fi
+  ask "Continue?" n || die "Cancelled."
+  need_root
+  local had_app_protection=0
+  app_protection_installed && had_app_protection=1
+  remove_client "$OPT_PURGE"
+  if [[ $(installed_method) != none ]]; then
+    die "Something is still installed in $ICAROOT; see $LOG_FILE."
+  fi
+  ok "Citrix Workspace app has been removed"
+  if [[ $had_app_protection -eq 1 ]]; then
+    warn "App Protection was installed: reboot to finish removing it."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Status and checks
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+  detect_os
+  local method version home
+  method=$(installed_method)
+  version=$(installed_version)
+  echo "System:     $(describe_os)"
+  [[ -n $OS_PROBLEM ]] && echo "            $OS_PROBLEM"
+  if [[ $method == none ]]; then
+    echo "Installed:  nothing"
+  else
+    echo "Installed:  ${version:-unknown version} ($method) in $ICAROOT"
+    if app_protection_installed; then
+      echo "            App Protection is installed"
+    fi
+  fi
+  while read -r home; do
+    if compgen -G "$home/ICAClient/linux*" >/dev/null; then
+      echo "Also found: a per-user tarball install in $home/ICAClient (not managed by ctxup)"
+    fi
+  done < <(human_homes)
+  return 0
+}
+
+# run_citrix_check -> runs Citrix's own checker and prints a summary. The
+# script always exits 0 and raises false alarms without a display, so its
+# result is informational only.
+run_citrix_check() {
+  local script="$ICAROOT/util/workspacecheck.sh" out good bad warnings
+  [[ -x $script ]] || script="$ICAROOT/util/hdxcheck.sh"
+  [[ -x $script ]] || return 0
+  out=$(mktemp "${TMPDIR:-/tmp}/ctxup-citrix-check.XXXXXX")
+  (cd "$ICAROOT/util" && TERM=dumb timeout 180 "$script" </dev/null 2>&1) |
+    sed -E $'s/\033\\[[0-9;]*[A-Za-z]//g' >"$out" || true
+  good=$(grep -ciE '^[[:space:]]*suc+es+' "$out" || true)
+  warnings=$(grep -ciE '^[[:space:]]*warning' "$out" || true)
+  bad=$(grep -ciE '^[[:space:]]*error' "$out" || true)
+  info "Citrix's own check (${script##*/}): $good passed, $warnings warnings, $bad errors"
+  echo "    Full output: $out" >&2
+  if [[ -z ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
+    echo "    No graphical session here, so its display, GPU and session checks are not meaningful." >&2
+  fi
+}
+
+cmd_check() {
+  detect_os
+  local method version rc=0 certs
+  method=$(installed_method)
+  if [[ $method == none ]]; then
+    die "Citrix Workspace app is not installed."
+  fi
+  version=$(installed_version)
+  info "Citrix Workspace app ${version:-unknown} ($method) on $(describe_os)"
+  if [[ -x $ICAROOT/wfica ]]; then
+    ok "Session client found: $ICAROOT/wfica"
+  else
+    err "$ICAROOT/wfica is missing"
+    rc=1
+  fi
+  report_libs || rc=1
+  if systemd_running; then
+    if systemctl is-active --quiet ctxcwalogd; then
+      ok "Logging service ctxcwalogd is running"
+    else
+      warn "Logging service ctxcwalogd is not running (start it with: systemctl start ctxcwalogd)"
+    fi
+  else
+    warn "systemd is not running, background services were not checked"
+  fi
+  certs=$(find "$ICAROOT/keystore/cacerts" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null | wc -l)
+  ok "$certs certificates in the client keystore"
+  if [[ ${XDG_SESSION_TYPE:-} == wayland ]]; then
+    warn "This is a Wayland session. Citrix supports X11 only; sessions run through XWayland and may misbehave."
+  fi
+  run_citrix_check
+  if [[ $rc -eq 0 ]]; then
+    ok "No blocking problems found"
+  else
+    err "Blocking problems found"
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Listing, downloading, menu
 # ---------------------------------------------------------------------------
 
 cmd_list() {
@@ -443,7 +1328,7 @@ cmd_download() {
   load_versions
   version=$(resolve_version "${OPT_VERSION:-latest}")
   load_packages "$version"
-  entry=$(pick_package main <<<"$PACKAGE_LIST") ||
+  entry=$(pick_package "$(kind_for_method "$(install_method_for_os)")" <<<"$PACKAGE_LIST") ||
     die "Version $version has no package for $(describe_os)."
   dest=${OPT_DIR:-$PWD}
   [[ -d $dest && -w $dest ]] || die "Cannot write to $dest."
@@ -451,34 +1336,121 @@ cmd_download() {
   ok "Saved to $dest/${entry%%|*}"
 }
 
+# choose_version -> sets OPT_VERSION from a numbered list
+choose_version() {
+  local count choice
+  cmd_list
+  count=$(wc -l <<<"$VERSION_LIST")
+  while true; do
+    read -r -p "Version number to install [1-$count, q to go back]: " choice || return 1
+    case $choice in
+      q | Q) return 1 ;;
+      "" | *[!0-9]*) echo "Please type a number between 1 and $count." ;;
+      *)
+        if ((10#$choice >= 1 && 10#$choice <= count)); then
+          OPT_VERSION=$(sed -n "$((10#$choice))p" <<<"$VERSION_LIST" | cut -d'|' -f1)
+          return 0
+        fi
+        echo "Please type a number between 1 and $count."
+        ;;
+    esac
+  done
+}
+
+cmd_menu() {
+  if [[ ! -t 0 ]]; then
+    usage
+    exit 1
+  fi
+  local choice
+  printf '%sctxup %s%s - Citrix Workspace app for Linux\n\n' "$C_BOLD" "$CTXUP_VERSION" "$C_RESET"
+  cmd_status
+  if [[ -n $OS_PROBLEM && $OPT_FORCE -eq 0 ]]; then
+    exit 1
+  fi
+  load_versions
+  while true; do
+    echo
+    echo "  1) Install the latest release ($(latest_version))"
+    echo "  2) Choose a version to install"
+    echo "  3) Check the installation"
+    echo "  4) Uninstall"
+    echo "  q) Quit"
+    read -r -p "Choice: " choice || exit 0
+    case $choice in
+      1)
+        OPT_VERSION=latest
+        cmd_install
+        return
+        ;;
+      2)
+        if choose_version; then
+          cmd_install
+          return
+        fi
+        ;;
+      3)
+        cmd_check || true
+        ;;
+      4)
+        cmd_uninstall
+        return
+        ;;
+      q | Q) exit 0 ;;
+      *) echo "Please type 1, 2, 3, 4 or q." ;;
+    esac
+  done
+}
+
 usage() {
   cat <<EOF
 ctxup $CTXUP_VERSION - install, update and remove Citrix Workspace app on Linux
 
-Usage: ctxup <command> [options]
+Usage: ctxup [command] [options]
+
+Without a command an interactive menu is shown.
 
 Commands:
-  list        Show the versions Citrix publishes for Linux
-  download    Download and verify a package without installing it
+  install      Install or update the client (latest release unless --version is given)
+  uninstall    Remove the client
+  list         Show the versions Citrix publishes for Linux
+  status       Show the detected system and what is installed
+  check        Verify an installed client: libraries, services, certificates
+  download     Download and verify a package without installing it
 
-Options:
-  --version V   Version to use, e.g. 2608 or 2604.10 (default: latest)
-  --dir PATH    Where 'download' saves the package (default: current directory)
-  --no-verify   Accept a package Citrix publishes no checksum for
-  --force       Continue on a distribution release ctxup is not tested on
-  -y, --yes     Answer yes to questions
-  --no-color    Plain output
-  -h, --help    Show this help
-  -V            Show the ctxup version
+Install options:
+  --version V        Version to install, e.g. 2608 or 2604.10 (default: latest)
+  --from-file PATH   Install a package you already downloaded
+  --accept-eula      Accept the Citrix licence agreement without being asked
+  --clean            Remove an existing copy first instead of upgrading in place
+  --with-usb         Also install the USB redirection package
+  --app-protection   Install App Protection (cannot be switched off later)
+  --device-trust     Install deviceTRUST (.deb only)
+  --epa              Install the Endpoint Analysis plug-in (.deb only)
+  --no-certs         Do not add the system CA certificates to the client keystore
+  --no-verify        Accept a package Citrix publishes no checksum for
+
+Uninstall options:
+  --purge            Also remove settings, logs and the citrixlog user
+
+General options:
+  --dir PATH         Where 'download' saves the package (default: current directory)
+  --dry-run          Show what would be done and stop
+  --force            Continue on a distribution release ctxup is not tested on
+  -y, --yes          Answer yes to questions (the licence still needs --accept-eula)
+  --no-color         Plain output
+  -h, --help         Show this help
+  -V                 Show the ctxup version
 EOF
 }
 
 COMMAND=""
 
 parse_args() {
+  ORIG_ARGS=("$@")
   while (($#)); do
     case $1 in
-      list | download)
+      install | uninstall | list | status | check | download)
         [[ -z $COMMAND ]] || die "Only one command can be given (got '$COMMAND' and '$1')."
         COMMAND=$1
         ;;
@@ -494,6 +1466,21 @@ parse_args() {
         shift
         ;;
       --dir=*) OPT_DIR=${1#*=} ;;
+      --from-file)
+        [[ $# -ge 2 ]] || die "--from-file needs a value."
+        OPT_FROM_FILE=$2
+        shift
+        ;;
+      --from-file=*) OPT_FROM_FILE=${1#*=} ;;
+      --accept-eula) OPT_ACCEPT_EULA=1 ;;
+      --clean) OPT_CLEAN=1 ;;
+      --purge) OPT_PURGE=1 ;;
+      --dry-run) OPT_DRY_RUN=1 ;;
+      --with-usb) OPT_USB=1 ;;
+      --app-protection) OPT_APP_PROTECTION=1 ;;
+      --device-trust) OPT_DEVICE_TRUST=1 ;;
+      --epa) OPT_EPA=1 ;;
+      --no-certs) OPT_CERTS=0 ;;
       --no-verify) OPT_NO_VERIFY=1 ;;
       --force) OPT_FORCE=1 ;;
       -y | --yes) OPT_YES=1 ;;
@@ -510,18 +1497,22 @@ parse_args() {
     esac
     shift
   done
+  if [[ -n $OPT_FROM_FILE && $OPT_FROM_FILE != /* ]]; then
+    OPT_FROM_FILE="$PWD/$OPT_FROM_FILE"
+  fi
 }
 
 main() {
   parse_args "$@"
   setup_colors
   case $COMMAND in
+    install) cmd_install ;;
+    uninstall) cmd_uninstall ;;
     list) cmd_list ;;
+    status) cmd_status ;;
+    check) cmd_check ;;
     download) cmd_download ;;
-    "")
-      usage
-      exit 1
-      ;;
+    "") cmd_menu ;;
   esac
 }
 

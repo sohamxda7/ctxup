@@ -1,0 +1,8 @@
+# Citrix packages fetched while testing. Never commit these: the Citrix
+# licence does not allow redistribution.
+/tests/.cache/
+/tests/.results/
+*.deb
+*.rpm
+*.tar.gz
+*.swp

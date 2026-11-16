@@ -1,0 +1,11 @@
+# Test image for Debian and Ubuntu: the base release plus systemd, so package
+# scripts that enable services behave as they do on a real machine.
+ARG BASE=docker.io/library/debian:12
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends systemd systemd-sysv dbus ca-certificates curl sudo \
+ && rm -rf /var/lib/apt/lists/*
+RUN systemctl mask getty.target console-getty.service systemd-logind.service
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

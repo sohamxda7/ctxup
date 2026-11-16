@@ -6,3 +6,4 @@
 *.rpm
 *.tar.gz
 *.swp
+!/tests/containers/Containerfile.*

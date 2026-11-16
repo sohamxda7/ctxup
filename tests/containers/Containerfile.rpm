@@ -1,0 +1,9 @@
+# Test image for RHEL-compatible releases: the base release plus systemd, so
+# package scripts that enable services behave as they do on a real machine.
+ARG BASE=quay.io/rockylinux/rockylinux:9
+FROM ${BASE}
+RUN dnf install -y --allowerasing systemd sudo curl ca-certificates \
+ && dnf clean all
+RUN systemctl mask getty.target console-getty.service systemd-logind.service
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

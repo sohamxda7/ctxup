@@ -4,8 +4,9 @@
 
 First release.
 
-- Detects Ubuntu, Debian and RHEL-compatible distributions, including
-  derivatives such as Linux Mint, Pop!_OS and LMDE.
+- Detects Ubuntu, Debian, Fedora and RHEL-compatible distributions,
+  including derivatives such as Linux Mint, Pop!_OS and LMDE.
+- Interactive menu that returns after each action.
 - Lists the releases Citrix publishes for Linux and installs the latest or
   any chosen one.
 - Verifies each download against the SHA-256 published by Citrix.

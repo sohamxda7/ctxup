@@ -1,0 +1,17 @@
+name: Distribution request
+description: Ask for a distribution or release to be supported
+labels: [distribution]
+body:
+  - type: textarea
+    id: osrelease
+    attributes:
+      label: Contents of /etc/os-release
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: force
+    attributes:
+      label: What happens with --force
+      description: Output of `ctxup install --force`, if you tried it.
+      render: text

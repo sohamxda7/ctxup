@@ -21,6 +21,7 @@ behind.
 - [How an existing installation is handled](#how-an-existing-installation-is-handled)
 - [Troubleshooting and FAQ](#troubleshooting-and-faq)
 - [Known limits](#known-limits)
+- [How it is tested](#how-it-is-tested)
 - [Is it safe to run?](#is-it-safe-to-run)
 - [Contributing](#contributing)
 - [Licence and trademarks](#licence-and-trademarks)
@@ -46,7 +47,7 @@ change the system.
 Running it without arguments opens a menu:
 
 ```text
-ctxup 0.1.0 - Citrix Workspace app for Linux
+ctxup 0.1.1 - Citrix Workspace app for Linux
 
 System:     Ubuntu 24.04.5 LTS (ubuntu 24.04, amd64)
 Installed:  nothing
@@ -139,6 +140,8 @@ workflow repeats it every week.
 | Ubuntu | 22.04, 24.04 | `.deb` | |
 | Ubuntu | 26.04, 26.10 | `.deb` | Needs Citrix release 2608 or newer |
 | Debian | 12, 13 | `.deb` | |
+| Linux Mint | 22.3 | `.deb` | Treated as Ubuntu 24.04 |
+| LMDE | 7 | `.deb` | Treated as Debian 13 |
 | RHEL, Rocky Linux, AlmaLinux | 8, 9 | `.rpm` | |
 | RHEL, Rocky Linux, AlmaLinux | 10 | tarball | Self-service window needs release 2608 or newer; EPEL is enabled |
 | Fedora | 44, 45 | tarball | Self-service window needs release 2608 or newer |
@@ -149,8 +152,8 @@ itself is not part of the automated run.
 
 Derivatives are mapped to their base release through `/etc/os-release`: Linux
 Mint, Pop!_OS, Zorin OS and elementary OS to their Ubuntu base; LMDE, MX Linux
-and Raspberry Pi OS to their Debian base. For these only the detection is
-tested, not a full install.
+and Raspberry Pi OS to their Debian base. Linux Mint and LMDE go through the
+full cycle above; for the others only the detection is tested.
 
 Releases outside the table are refused unless you pass `--force`.
 
@@ -247,11 +250,50 @@ and please open an issue.
   against libraries that Ubuntu 26.04, RHEL 10 and Fedora no longer ship.
   `ctxup` installs them if asked and reports exactly what is missing.
 - **deviceTRUST and EPA** can only be selected on Debian and Ubuntu.
-- **Not covered by the automated tests:** opening a real session, USB
-  redirection, App Protection, and SELinux in enforcing mode. They need a
-  desktop, hardware or a full boot, which containers do not provide.
+- **App Protection** is supported by Citrix on Ubuntu 22.04/24.04 and RHEL 9
+  only. `ctxup` asks before installing it anywhere else, and refuses on RHEL 8,
+  whose C library is too old for Citrix's App Protection service to start. It needs a reboot
+  after installing and after removing, and it cannot be switched off without
+  removing the client. Until that reboot, running programs still carry its
+  library and can recreate an empty `~/.ICAClient`; run
+  `ctxup uninstall --purge` once more afterwards if that matters to you.
+- **Citrix asks for its licence once more.** The first time each user starts
+  the client, Citrix shows its own licence window. That is separate from the
+  question `ctxup` asks.
+- **Not covered by any test:** a real session against a Citrix server, and
+  moving a real USB device into a session. Both need a Citrix environment
+  and an account, and Citrix offers no public test server.
 - **The checksum comes from citrix.com**, the same site as the download. It
   catches a corrupted or swapped file, not a compromise of citrix.com itself.
+
+## How it is tested
+
+Containers cannot boot, enforce SELinux or show a window, so the tests run at
+three levels:
+
+| Level | What runs | Where |
+| --- | --- | --- |
+| Unit tests | Parsing, OS detection, upgrade decisions | Every push |
+| Container matrix | Install, upgrade, downgrade, uninstall and purge with the real Citrix packages on 16 releases | Every push and weekly |
+| [Virtual machines](tests/vm/README.md) | Everything a container cannot show, see below | By hand before a release |
+
+The virtual machine run uses the vendors' cloud images of Ubuntu 24.04 and
+26.04, Debian 13, Rocky Linux 8, 9 and 10 and Fedora 44, each with a GNOME
+desktop. On every one of them:
+
+- an ordinary user installs through `sudo`, with SELinux enforcing on Rocky
+  and Fedora and AppArmor on Ubuntu and Debian, and the audit log is checked
+  for denials caused by the client;
+- the machine is rebooted and the Citrix services have to come back;
+- the self-service window, the preferences window and the session client are
+  started in the logged-in Wayland session and have to stay up without a
+  crash.
+
+USB redirection, App Protection, deviceTRUST and EPA are installed where
+Citrix offers them (Ubuntu 24.04 and 26.04, Debian 13, Rocky 9; USB only on
+Rocky 8), followed by a reboot, an
+uninstall and another reboot, to check that the machine still starts and
+nothing is left behind.
 
 ## Is it safe to run?
 

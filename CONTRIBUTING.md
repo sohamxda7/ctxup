@@ -43,6 +43,10 @@ Security problems go through private reporting, not issues. See
    tests/matrix.sh ubuntu-24.04 rocky-9
    ```
 
+5. Changes around services, App Protection, SELinux or anything that only
+   shows after a reboot can be tried in a virtual machine; see
+   [tests/vm](tests/vm/README.md).
+
 The script must keep working on bash 4.4, which is what RHEL 8 ships, so
 avoid newer features such as `${var@Q}` or `wait -p`.
 

@@ -18,6 +18,10 @@ and real reboots.
   service against glibc 2.34, so there it installs but never starts.
 - `check` reports an App Protection service that is installed but not
   running.
+- Fixed: on Ubuntu 26.10 the USB daemon never started. Citrix registers it
+  only through an `/etc/init.d` script, and systemd 260 and newer no longer
+  run those. `ctxup` now adds a systemd service for it when needed, also on
+  a plain rerun of `ctxup install`, and `check` reports a stopped USB daemon.
 - Linux Mint 22.3 and LMDE 7 are now part of the container matrix.
 - `tests/vm` holds the scripts for the virtual machine run.
 - The README describes how the project is tested, including the virtual

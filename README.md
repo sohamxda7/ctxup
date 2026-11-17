@@ -277,11 +277,11 @@ three levels:
 | Container matrix | Install, upgrade, downgrade, uninstall and purge with the real Citrix packages on 16 releases | Every push and weekly |
 | [Virtual machines](tests/vm/README.md) | Everything a container cannot show, see below | By hand before a release |
 
-The virtual machine run uses the vendors' cloud images of Ubuntu 24.04 and
-26.04, Debian 13, Rocky Linux 8, 9 and 10 and Fedora 44, each with a GNOME
-desktop. On every one of them:
+The virtual machine run uses the vendors' cloud images of every release in
+[Supported distributions](#supported-distributions) except Linux Mint and
+LMDE, each with a GNOME desktop. On every one of them:
 
-- an ordinary user installs through `sudo`, with SELinux enforcing on Rocky
+- an ordinary user installs through `sudo`, with SELinux enforcing on Rocky, Alma
   and Fedora and AppArmor on Ubuntu and Debian, and the audit log is checked
   for denials caused by the client;
 - the machine is rebooted and the Citrix services have to come back;
@@ -290,8 +290,7 @@ desktop. On every one of them:
   crash.
 
 USB redirection, App Protection, deviceTRUST and EPA are installed where
-Citrix offers them (Ubuntu 24.04 and 26.04, Debian 13, Rocky 9; USB only on
-Rocky 8), followed by a reboot, an
+Citrix offers them (Ubuntu and Debian, RHEL 9; USB only on RHEL 8), followed by a reboot, an
 uninstall and another reboot, to check that the machine still starts and
 nothing is left behind.
 

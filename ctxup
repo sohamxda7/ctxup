@@ -981,6 +981,43 @@ glibc_at_least() {
   [[ $(version_cmp "$have" "$1") != lt ]]
 }
 
+# ensure_usb_unit -> starts the USB daemon where systemd ignores Citrix's script.
+# The ctxusb package registers its daemon only through /etc/init.d. systemd
+# 260 and newer no longer read those scripts (Ubuntu 26.10 has 261), so the
+# daemon would never start. Add a native unit in that case only.
+ensure_usb_unit() {
+  systemd_running || return 0
+  [[ -x $ICAROOT/ctxusbd && -e /etc/init.d/ctxusbd ]] || return 0
+  if systemctl cat ctxusbd.service >/dev/null 2>&1; then
+    return 0
+  fi
+  cat >/etc/systemd/system/ctxusbd.service <<UNIT
+# Added by ctxup: this systemd no longer runs /etc/init.d/ctxusbd.
+[Unit]
+Description=Citrix USB daemon
+After=ctxcwalogd.service
+ConditionPathIsDirectory=/dev/bus/usb
+
+[Service]
+# Same settings systemd used for the init script: the daemon forks twice.
+Type=forking
+RemainAfterExit=yes
+GuessMainPID=no
+RuntimeDirectory=ctxusbd
+RuntimeDirectoryMode=0700
+ExecStart=$ICAROOT/ctxusbd
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if run_logged "enable ctxusbd" systemctl enable --now ctxusbd.service; then
+    info "Added a systemd service for the USB daemon (this systemd ignores Citrix's init script)"
+  else
+    warn "Could not start the Citrix USB daemon; see: systemctl status ctxusbd"
+  fi
+}
+
 extras_not_supported() {
   local method=$1 unsupported=()
   # Citrix builds the App Protection service against glibc 2.34. On older
@@ -1091,6 +1128,7 @@ cmd_install() {
         if [[ $OPT_YES -eq 1 || ! -t 0 ]] ||
           ! ask "Version $target_version is already installed. Reinstall it?" n; then
           ok "Version $target_version is already installed. Nothing to do (use --clean to reinstall)."
+          [[ $OPT_DRY_RUN -eq 0 ]] && ensure_usb_unit
           return 0
         fi
       fi
@@ -1156,6 +1194,7 @@ cmd_install() {
 
   [[ $OPT_CERTS -eq 1 ]] && link_system_certs
 
+  [[ -n $usb_file ]] && ensure_usb_unit
   local now
   now=$(installed_version)
   if [[ $now != "$target_version" ]]; then
@@ -1439,6 +1478,15 @@ cmd_check() {
       ok "Logging service ctxcwalogd is running"
     else
       warn "Logging service ctxcwalogd is not running (start it with: systemctl start ctxcwalogd)"
+    fi
+    # The daemon is root-only (mode 0500), so test that it exists, not -x.
+    if [[ -e $ICAROOT/ctxusbd ]]; then
+      if systemctl is-active --quiet ctxusbd; then
+        ok "USB daemon ctxusbd is running"
+      elif [[ -d /dev/bus/usb ]]; then
+        warn "USB support is installed but ctxusbd is not running. Run 'ctxup install'"
+        warn "once more to register it, or see: systemctl status ctxusbd"
+      fi
     fi
     if app_protection_installed; then
       if systemctl is-active --quiet AppProtectionService-install; then

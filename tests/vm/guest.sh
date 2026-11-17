@@ -131,7 +131,10 @@ gui_stop() {
 denials() {
   local out=""
   if command -v ausearch >/dev/null 2>&1; then
-    out=$(ausearch --input-logs -m avc,user_avc,selinux_err -ts boot 2>/dev/null | grep denied)
+    # Only denials that involve the client; the distribution's own daemons
+    # (tuned-ppd on AlmaLinux 9, for one) have unrelated ones.
+    out=$(ausearch --input-logs -m avc,user_avc,selinux_err -ts boot 2>/dev/null | grep denied |
+      grep -iE 'citrix|icaclient|wfica|selfservice|ctxusb|ctxcwalog|AppProtection|AuthMan|ServiceRecord')
   else
     out=$(journalctl -b --no-pager 2>/dev/null | grep 'apparmor="DENIED"' |
       grep -iE 'citrix|icaclient|wfica|selfservice|ctxusb|ctxcwalog')

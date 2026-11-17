@@ -972,8 +972,22 @@ install_tarball() {
   install_missing_libs
 }
 
+# glibc_at_least MAJOR.MINOR -> true when the C library is that version or newer
+glibc_at_least() {
+  local have
+  have=$(getconf GNU_LIBC_VERSION 2>/dev/null) || return 0
+  have=${have##* }
+  [[ $have =~ ^[0-9]+\.[0-9]+ ]] || return 0
+  [[ $(version_cmp "$have" "$1") != lt ]]
+}
+
 extras_not_supported() {
   local method=$1 unsupported=()
+  # Citrix builds the App Protection service against glibc 2.34. On older
+  # systems, RHEL 8 among them, it installs but can never start.
+  if [[ $OPT_APP_PROTECTION -eq 1 ]] && ! glibc_at_least 2.34; then
+    die "--app-protection cannot be used on $(describe_os): Citrix's App Protection needs glibc 2.34 or newer."
+  fi
   if [[ $method == tarball ]]; then
     [[ $OPT_USB -eq 1 ]] && unsupported+=("--with-usb")
     [[ $OPT_APP_PROTECTION -eq 1 ]] && unsupported+=("--app-protection")
@@ -1425,6 +1439,14 @@ cmd_check() {
       ok "Logging service ctxcwalogd is running"
     else
       warn "Logging service ctxcwalogd is not running (start it with: systemctl start ctxcwalogd)"
+    fi
+    if app_protection_installed; then
+      if systemctl is-active --quiet AppProtectionService-install; then
+        ok "App Protection service is running"
+      elif [[ -e /usr/lib/systemd/system/AppProtectionService-install.service ]]; then
+        warn "App Protection is installed but its service is not running. Protected"
+        warn "apps will not start. See: systemctl status AppProtectionService-install"
+      fi
     fi
   else
     warn "systemd is not running, background services were not checked"

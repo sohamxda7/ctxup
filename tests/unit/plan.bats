@@ -173,3 +173,16 @@ HINST
   OS_BASE=el OS_BASE_VER=10
   if app_protection_supported; then false; fi
 }
+
+@test "glibc_at_least compares against the running C library" {
+  getconf() { echo "glibc 2.28"; }
+  if glibc_at_least 2.34; then false; fi
+  glibc_at_least 2.28
+  getconf() { echo "glibc 2.39"; }
+  glibc_at_least 2.34
+}
+
+@test "glibc_at_least does not block when the version is unknown" {
+  getconf() { return 1; }
+  glibc_at_least 2.34
+}

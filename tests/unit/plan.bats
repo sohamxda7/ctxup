@@ -126,3 +126,50 @@ HINST
   run need_space / 1 "the test"
   [ "$status" -eq 0 ]
 }
+
+@test "clean_preload: removes the App Protection entry and the empty file" {
+  CTXUP_TMP=$(mktemp -d)
+  PRELOAD_FILE=$CTXUP_TMP/ld.so.preload
+  echo "/usr/local/lib/AppProtection/libAppProtection.so" >"$PRELOAD_FILE"
+  clean_preload all 2>/dev/null
+  [ ! -e "$PRELOAD_FILE" ]
+  rm -rf "$CTXUP_TMP"
+}
+
+@test "clean_preload: keeps entries that belong to other software" {
+  CTXUP_TMP=$(mktemp -d)
+  PRELOAD_FILE=$CTXUP_TMP/ld.so.preload
+  printf '%s\n' /usr/lib/libother.so /usr/local/lib/AppProtection/libAppProtection.so >"$PRELOAD_FILE"
+  clean_preload all 2>/dev/null
+  [ "$(cat "$PRELOAD_FILE")" = "/usr/lib/libother.so" ]
+  rm -rf "$CTXUP_TMP"
+}
+
+@test "clean_preload: without 'all' only drops entries whose library is gone" {
+  CTXUP_TMP=$(mktemp -d)
+  PRELOAD_FILE=$CTXUP_TMP/ld.so.preload
+  mkdir -p "$CTXUP_TMP/AppProtection"
+  touch "$CTXUP_TMP/AppProtection/live.so"
+  printf '%s\n' "$CTXUP_TMP/AppProtection/live.so" "$CTXUP_TMP/AppProtection/gone.so" >"$PRELOAD_FILE"
+  clean_preload 2>/dev/null
+  [ "$(cat "$PRELOAD_FILE")" = "$CTXUP_TMP/AppProtection/live.so" ]
+  rm -rf "$CTXUP_TMP"
+}
+
+@test "clean_preload: no file is not an error" {
+  PRELOAD_FILE=/nonexistent/ld.so.preload
+  clean_preload all
+}
+
+@test "app_protection_supported: only the systems Citrix lists" {
+  OS_BASE=ubuntu OS_BASE_VER=24.04
+  app_protection_supported
+  OS_BASE=el OS_BASE_VER=9
+  app_protection_supported
+  OS_BASE=ubuntu OS_BASE_VER=26.04
+  if app_protection_supported; then false; fi
+  OS_BASE=debian OS_BASE_VER=13
+  if app_protection_supported; then false; fi
+  OS_BASE=el OS_BASE_VER=10
+  if app_protection_supported; then false; fi
+}

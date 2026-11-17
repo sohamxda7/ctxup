@@ -22,7 +22,7 @@ fi
 
 set -Eeuo pipefail
 
-CTXUP_VERSION="0.1.0"
+CTXUP_VERSION="0.1.1"
 
 CITRIX_SITE="https://www.citrix.com"
 INDEX_URL="${CTXUP_INDEX_URL:-$CITRIX_SITE/downloads/workspace-app/}"
@@ -58,6 +58,7 @@ OPT_DEVICE_TRUST=0
 OPT_EPA=0
 
 LOG_FILE="${CTXUP_LOG:-/var/log/ctxup.log}"
+PRELOAD_FILE="${CTXUP_PRELOAD_FILE:-/etc/ld.so.preload}"
 ORIG_ARGS=()
 
 # Filled in by detect_os.
@@ -581,6 +582,14 @@ app_protection_installed() {
   return 1
 }
 
+# app_protection_supported -> true on the systems Citrix lists for it
+app_protection_supported() {
+  case $OS_BASE:$OS_BASE_VER in
+    ubuntu:22.04 | ubuntu:24.04 | el:9) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # version_cmp A B -> prints lt, eq or gt
 version_cmp() {
   if [[ $1 == "$2" ]]; then
@@ -1001,6 +1010,13 @@ cmd_install() {
   local have_method have_version action package usb_file="" ap_file=""
   method=$(install_method_for_os)
   extras_not_supported "$method"
+  if [[ $OPT_APP_PROTECTION -eq 1 ]] && ! app_protection_supported; then
+    warn "Citrix supports App Protection only on Ubuntu 22.04/24.04 and RHEL 9."
+    warn "On $(describe_os) it may install, but Citrix has not tested it there."
+    if [[ $OPT_DRY_RUN -eq 0 ]]; then
+      ask "Install App Protection anyway?" n || die "Cancelled."
+    fi
+  fi
 
   if [[ -n $OPT_FROM_FILE ]]; then
     check_from_file "$method" "$OPT_FROM_FILE"
@@ -1092,6 +1108,7 @@ cmd_install() {
   fi
 
   accept_eula
+  clean_preload
   need_space /opt 1200 "the client"
   make_workdir
 
@@ -1167,6 +1184,38 @@ remove_tarball() {
 }
 
 # remove_client PURGE(0|1) -> removes the client and what it leaves behind.
+# has_leftovers -> true when a removed client left something that still matters
+has_leftovers() {
+  if [[ -f $PRELOAD_FILE ]] && grep -q '/AppProtection/' "$PRELOAD_FILE" 2>/dev/null; then
+    return 0
+  fi
+  [[ -L /usr/local/bin/nsgcepa && ! -e /usr/local/bin/nsgcepa ]]
+}
+
+# clean_preload [all] -> takes App Protection out of the loader's preload list.
+# Citrix leaves that to a helper that runs at shutdown. With SELinux enforcing
+# the helper is not allowed to run, the library is deleted at the next boot
+# anyway, and from then on every program prints a loader error. Without "all"
+# only entries whose library is already gone are removed.
+clean_preload() {
+  local mode=${1:-stale} file=$PRELOAD_FILE line kept="" changed=0
+  [[ -f $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == */AppProtection/* ]] && [[ $mode == all || ! -e $line ]]; then
+      changed=1
+      continue
+    fi
+    kept+="$line"$'\n'
+  done <"$file"
+  [[ $changed -eq 1 ]] || return 0
+  if [[ -n ${kept//[[:space:]]/} ]]; then
+    printf '%s' "$kept" >"$file"
+  else
+    rm -f "$file"
+  fi
+  info "Removed the App Protection entry from $file"
+}
+
 remove_client() {
   local purge=$1 method packages=() name home
   method=$(installed_method)
@@ -1215,11 +1264,17 @@ remove_client() {
   fi
 
   # Things the packages and the tarball installer leave behind.
+  clean_preload all
   if systemd_running; then
     for name in ctxcwalogd ctxusbd; do
       systemctl stop "$name" >/dev/null 2>&1 || true
       systemctl disable "$name" >/dev/null 2>&1 || true
+      systemctl reset-failed "$name" >/dev/null 2>&1 || true
     done
+  fi
+  # The Endpoint Analysis plug-in is reached through a link into /opt/Citrix.
+  if [[ -L /usr/local/bin/nsgcepa && $(readlink /usr/local/bin/nsgcepa) == /opt/Citrix/* ]]; then
+    rm -f /usr/local/bin/nsgcepa
   fi
   rm -f /etc/init.d/ctxcwalogd /etc/systemd/system/ctxcwalogd.service \
     /etc/systemd/system/ctxusbd.service /lib/systemd/system/ctxcwalogd.service \
@@ -1227,7 +1282,7 @@ remove_client() {
   if systemd_running; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
-  rm -rf -- "$ICAROOT"
+  rm -rf -- "$ICAROOT" /opt/Citrix/Browser-EPA
   rmdir /opt/Citrix 2>/dev/null || true
   # On RPM systems the Citrix scripts may have created /etc/init.d themselves.
   if [[ $OS_FAMILY == rpm && -d /etc/init.d && ! -L /etc/init.d ]]; then
@@ -1253,7 +1308,7 @@ cmd_uninstall() {
   local method version home found=0
   method=$(installed_method)
   version=$(installed_version)
-  if [[ $method == none && $OPT_PURGE -eq 0 ]]; then
+  if [[ $method == none && $OPT_PURGE -eq 0 ]] && ! has_leftovers; then
     ok "Citrix Workspace app is not installed."
     return 0
   fi
@@ -1262,6 +1317,9 @@ cmd_uninstall() {
   fi
   if [[ $method != none ]]; then
     echo "This will remove Citrix Workspace app ${version:-} ($method) from $ICAROOT." >&2
+  elif has_leftovers; then
+    echo "Citrix Workspace app is not installed, but an earlier copy left files behind." >&2
+    echo "This will clean them up." >&2
   fi
   if [[ $OPT_PURGE -eq 1 ]]; then
     echo "With --purge it also removes:" >&2
@@ -1290,6 +1348,10 @@ cmd_uninstall() {
   ok "Citrix Workspace app has been removed"
   if [[ $had_app_protection -eq 1 ]]; then
     warn "App Protection was installed: reboot to finish removing it."
+    if [[ $OPT_PURGE -eq 1 ]]; then
+      warn "Programs that are still running keep its library until then and can"
+      warn "recreate ~/.ICAClient. Run this command once more after the reboot."
+    fi
   fi
   return 0
 }

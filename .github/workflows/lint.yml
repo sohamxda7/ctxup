@@ -40,9 +40,9 @@ jobs:
           chmod +x bin/shfmt
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: ShellCheck
-        run: shellcheck ctxup tests/*.sh
+        run: shellcheck ctxup tests/*.sh tests/vm/*.sh
       - name: shfmt
-        run: shfmt -d -i 2 -ci ctxup tests/*.sh
+        run: shfmt -d -i 2 -ci ctxup tests/*.sh tests/vm/*.sh
 
   bash44:
     name: Runs on bash 4.4 (RHEL 8)

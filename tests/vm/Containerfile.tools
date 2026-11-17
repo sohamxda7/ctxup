@@ -1,0 +1,5 @@
+# Disk image and ISO tools for tests/vm/vm.sh, so nothing is installed on the host.
+FROM docker.io/library/debian:13
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends qemu-utils genisoimage \
+    && rm -rf /var/lib/apt/lists/*

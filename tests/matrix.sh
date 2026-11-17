@@ -28,6 +28,8 @@ ubuntu-26.04|docker.io/library/ubuntu:26.04|deb|unsupported
 ubuntu-26.10|docker.io/library/ubuntu:26.10|deb|unsupported
 debian-12|docker.io/library/debian:12|deb|ok
 debian-13|docker.io/library/debian:13|deb|ok
+mint-22.3|docker.io/linuxmintd/mint22.3-amd64:latest|deb|ok
+lmde-7|docker.io/linuxmintd/lmde7-amd64:latest|deb|ok
 rocky-8|quay.io/rockylinux/rockylinux:8|rpm|ok
 rocky-9|quay.io/rockylinux/rockylinux:9|rpm|ok
 rocky-10|quay.io/rockylinux/rockylinux:10|tarball|ok
